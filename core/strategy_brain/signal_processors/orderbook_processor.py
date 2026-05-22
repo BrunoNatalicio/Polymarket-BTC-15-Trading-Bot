@@ -34,22 +34,24 @@ SIGNAL LOGIC:
   We also check WALL detection: a single order > 20% of total book
   volume indicates a large player taking a strong position.
 """
-import httpx
-from decimal import Decimal
-from datetime import datetime
-from typing import Optional, Dict, Any, List
-from loguru import logger
 
 import os
 import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from datetime import datetime
+from decimal import Decimal
+from typing import Any
+
+import httpx
+from loguru import logger
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from core.strategy_brain.signal_processors.base_processor import (
     BaseSignalProcessor,
-    TradingSignal,
-    SignalType,
     SignalDirection,
     SignalStrength,
+    SignalType,
+    TradingSignal,
 )
 
 CLOB_BASE = "https://clob.polymarket.com"
@@ -68,11 +70,11 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
 
     def __init__(
         self,
-        imbalance_threshold: float = 0.30,   # 30% skew to signal
-        wall_threshold: float = 0.20,         # single order > 20% of book = wall
-        min_book_volume: float = 50.0,        # ignore books with < $50 total (illiquid)
+        imbalance_threshold: float = 0.30,  # 30% skew to signal
+        wall_threshold: float = 0.20,  # single order > 20% of book = wall
+        min_book_volume: float = 50.0,  # ignore books with < $50 total (illiquid)
         min_confidence: float = 0.55,
-        top_levels: int = 10,                 # how many price levels to consider
+        top_levels: int = 10,  # how many price levels to consider
     ):
         super().__init__("OrderBookImbalance")
 
@@ -83,7 +85,7 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
         self.top_levels = top_levels
 
         # HTTP client created fresh per request (synchronous, safe in Nautilus event loop)
-        self._cache: Optional[Dict] = None
+        self._cache: dict | None = None
 
         logger.info(
             f"Initialized Order Book Imbalance Processor: "
@@ -96,7 +98,7 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
         """Return a synchronous httpx client (safe inside NautilusTrader's event loop)."""
         return httpx.Client(timeout=5.0)
 
-    def fetch_order_book(self, token_id: str) -> Optional[Dict]:
+    def fetch_order_book(self, token_id: str) -> dict | None:
         """Fetch order book from Polymarket CLOB synchronously."""
         try:
             with self._get_client() as client:
@@ -110,23 +112,23 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
             logger.warning(f"OrderBook fetch failed for {token_id[:16]}…: {e}")
             return None
 
-    def _parse_levels(self, levels: List[Dict]) -> float:
+    def _parse_levels(self, levels: list[dict]) -> float:
         """Sum total volume across price levels (returns USD volume)."""
         total = 0.0
-        for level in levels[:self.top_levels]:
+        for level in levels[: self.top_levels]:
             try:
                 price = float(level.get("price", 0))
                 size = float(level.get("size", 0))
-                total += price * size   # USD value at each level
+                total += price * size  # USD value at each level
             except (ValueError, TypeError):
                 continue
         return total
 
-    def _detect_wall(self, levels: List[Dict], total_volume: float) -> Optional[float]:
+    def _detect_wall(self, levels: list[dict], total_volume: float) -> float | None:
         """Return the size of the largest single order if it's a wall, else None."""
         if total_volume <= 0:
             return None
-        for level in levels[:self.top_levels]:
+        for level in levels[: self.top_levels]:
             try:
                 price = float(level.get("price", 0))
                 size = float(level.get("size", 0))
@@ -141,8 +143,8 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
         self,
         current_price: Decimal,
         historical_prices: list,
-        metadata: Dict[str, Any] = None,
-    ) -> Optional[TradingSignal]:
+        metadata: dict[str, Any] = None,
+    ) -> TradingSignal | None:
         """Fetch order book synchronously and generate signal."""
         if not self.is_enabled or not metadata:
             return None
@@ -180,10 +182,14 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
             ask_wall = self._detect_wall(asks, total_volume)
 
             if abs(imbalance) < self.imbalance_threshold:
-                logger.debug(f"OrderBook balanced (imbalance={imbalance:+.3f}) — no signal")
+                logger.debug(
+                    f"OrderBook balanced (imbalance={imbalance:+.3f}) — no signal"
+                )
                 return None
 
-            direction = SignalDirection.BULLISH if imbalance > 0 else SignalDirection.BEARISH
+            direction = (
+                SignalDirection.BULLISH if imbalance > 0 else SignalDirection.BEARISH
+            )
             abs_imb = abs(imbalance)
 
             if abs_imb >= 0.70:
@@ -222,7 +228,7 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
                     "imbalance": round(imbalance, 4),
                     "bid_wall_usd": round(bid_wall, 2) if bid_wall else None,
                     "ask_wall_usd": round(ask_wall, 2) if ask_wall else None,
-                }
+                },
             )
 
             self._record_signal(signal)

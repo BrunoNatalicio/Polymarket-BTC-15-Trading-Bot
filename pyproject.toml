@@ -1,0 +1,58 @@
+[project]
+name = "developmentbot-polymarket"
+version = "0.1.0"
+description = "Polymarket BTC 15-minute algorithmic trading bot"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pip-audit>=2.10.0",
+    "pyright>=1.1.409",
+    "pytest>=9.0.3",
+    "ruff>=0.15.14",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C90", "S", "T20"]
+ignore = [
+    "S101",   # assert statements (usados em testes)
+    "S603",   # subprocess calls (necessário para bot runner)
+    "S607",   # partial path calls
+    "T201",   # print statements (usados em scripts utilitários)
+    "C901",   # complexity (bot.py é complexo por necessidade)
+    "E501",   # line too long (formatador já cuida disso)
+    "SIM105", # contextlib.suppress (preferência de estilo)
+    "SIM102", # nested if (legibilidade intencional)
+    "UP007",  # X | Y union syntax (compatibilidade)
+    "B904",   # raise from (em excepts genéricos de bot)
+    "S311",   # random não-criptográfico (usado em simulação)
+    "S104",   # bind a todas interfaces (intencional em Prometheus exporter)
+    "S110",   # try-except-pass (silenciamento intencional em monitoring)
+    "S112",   # try-except-continue (resiliência intencional)
+    "E722",   # bare except (resiliência intencional em bot de trading)
+    "SIM108", # ternary operator (legibilidade preferida)
+    "SIM103", # return condition (legibilidade preferida)
+    "B007",   # unused loop variable (padrão em testes)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"bot.py" = ["E402", "F841", "UP031"]  # patches antes de imports; vars de debug; % format
+"**/test_*.py" = ["S", "T20"]         # testes: prints e sem validação de segurança
+"test.py" = ["S", "T20"]
+"grafana/*.py" = ["S105"]             # credenciais Grafana via env (não hardcoded real)
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pyright]
+pythonVersion = "3.13"
+typeCheckingMode = "basic"
+reportMissingImports = false
+reportMissingModuleSource = false

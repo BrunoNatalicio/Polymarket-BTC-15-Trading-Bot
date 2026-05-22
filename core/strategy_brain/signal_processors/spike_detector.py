@@ -13,21 +13,24 @@ FIX: Original threshold was 15% deviation, designed for dollar prices.
        - Also detect VELOCITY (fast moves in the last 3 ticks)
        - Mean reversion logic is still correct: spike up → BEARISH, spike down → BULLISH
 """
-from decimal import Decimal
-from datetime import datetime
-from typing import Optional, Dict, Any
-from loguru import logger
+
 import os
 import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from datetime import datetime
+from decimal import Decimal
+from typing import Any
+
+from loguru import logger
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 
 from core.strategy_brain.signal_processors.base_processor import (
     BaseSignalProcessor,
-    TradingSignal,
-    SignalType,
     SignalDirection,
     SignalStrength,
+    SignalType,
+    TradingSignal,
 )
 
 
@@ -49,10 +52,10 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
 
     def __init__(
         self,
-        spike_threshold: float = 0.05,    # FIXED: was 0.15, now 0.05 for probability prices
+        spike_threshold: float = 0.05,  # FIXED: was 0.15, now 0.05 for probability prices
         lookback_periods: int = 20,
-        min_confidence: float = 0.55,     # FIXED: was 0.60, slightly lower for more signals
-        velocity_threshold: float = 0.03, # 3% move in 3 ticks = velocity spike
+        min_confidence: float = 0.55,  # FIXED: was 0.60, slightly lower for more signals
+        velocity_threshold: float = 0.03,  # 3% move in 3 ticks = velocity spike
     ):
         super().__init__("SpikeDetection")
 
@@ -72,8 +75,8 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
         self,
         current_price: Decimal,
         historical_prices: list,
-        metadata: Dict[str, Any] = None,
-    ) -> Optional[TradingSignal]:
+        metadata: dict[str, Any] = None,
+    ) -> TradingSignal | None:
         """
         Detect probability spikes and generate mean-reversion or momentum signals.
         """
@@ -84,7 +87,7 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
             return None
 
         # --- Compute 20-period MA ---
-        recent = historical_prices[-self.lookback_periods:]
+        recent = historical_prices[-self.lookback_periods :]
         ma = sum(float(p) for p in recent) / len(recent)
         curr = float(current_price)
 
@@ -112,7 +115,9 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
             )
 
             # Fade the spike (mean reversion)
-            direction = SignalDirection.BEARISH if deviation > 0 else SignalDirection.BULLISH
+            direction = (
+                SignalDirection.BEARISH if deviation > 0 else SignalDirection.BULLISH
+            )
             target = Decimal(str(ma))
 
             # Strength by magnitude (calibrated for 0-1 probability prices)
@@ -132,7 +137,8 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
 
             stop_distance = abs(Decimal(str(curr)) - Decimal(str(ma))) * Decimal("1.5")
             stop_loss = (
-                Decimal(str(curr)) + stop_distance if direction == SignalDirection.BEARISH
+                Decimal(str(curr)) + stop_distance
+                if direction == SignalDirection.BEARISH
                 else Decimal(str(curr)) - stop_distance
             )
 
@@ -152,7 +158,7 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
                     "moving_average": ma,
                     "velocity": velocity,
                     "spike_direction": "up" if deviation > 0 else "down",
-                }
+                },
             )
             self._record_signal(signal)
             logger.info(
@@ -166,13 +172,16 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
         # SIGNAL 2: VELOCITY SPIKE → short-term momentum continuation
         # Only fires when price is NOT already at an MA extreme (no double-signal)
         # =====================================================================
-        if abs(velocity) >= self.velocity_threshold and deviation_abs < self.spike_threshold * 0.6:
-            logger.info(
-                f"Velocity spike: {velocity:+.3%} in last 3 ticks"
-            )
+        if (
+            abs(velocity) >= self.velocity_threshold
+            and deviation_abs < self.spike_threshold * 0.6
+        ):
+            logger.info(f"Velocity spike: {velocity:+.3%} in last 3 ticks")
 
             # Momentum continuation (short-term, lower confidence)
-            direction = SignalDirection.BULLISH if velocity > 0 else SignalDirection.BEARISH
+            direction = (
+                SignalDirection.BULLISH if velocity > 0 else SignalDirection.BEARISH
+            )
 
             vel_strength = abs(velocity) / self.velocity_threshold
             if vel_strength >= 3:
@@ -201,7 +210,7 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
                     "velocity_pct": velocity,
                     "moving_average": ma,
                     "deviation_pct": deviation,
-                }
+                },
             )
             self._record_signal(signal)
             logger.info(

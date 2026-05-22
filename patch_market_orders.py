@@ -32,11 +32,17 @@ def apply_market_order_patch():
         return True
 
     try:
-        from nautilus_trader.adapters.polymarket.execution import PolymarketExecutionClient
-        from nautilus_trader.adapters.polymarket.common.symbol import get_polymarket_token_id
-        from nautilus_trader.adapters.polymarket.http.conversion import convert_tif_to_polymarket_order_type
-        from nautilus_trader.model.enums import OrderSide, order_side_to_str
+        from nautilus_trader.adapters.polymarket.common.symbol import (
+            get_polymarket_token_id,
+        )
+        from nautilus_trader.adapters.polymarket.execution import (
+            PolymarketExecutionClient,
+        )
+        from nautilus_trader.adapters.polymarket.http.conversion import (
+            convert_tif_to_polymarket_order_type,
+        )
         from nautilus_trader.common.enums import LogColor
+        from nautilus_trader.model.enums import OrderSide, order_side_to_str
         from py_clob_client.client import MarketOrderArgs, PartialCreateOrderOptions
 
         # --- Read USD amount from environment (default $1) ---
@@ -54,7 +60,9 @@ def apply_market_order_patch():
 
             if order.side == OrderSide.BUY:
                 # Read amount each call so live env changes take effect
-                usd_amount = float(os.getenv("MARKET_BUY_USD", str(_DEFAULT_USD_AMOUNT)))
+                usd_amount = float(
+                    os.getenv("MARKET_BUY_USD", str(_DEFAULT_USD_AMOUNT))
+                )
 
                 self._log.info(
                     f"[PATCH] BUY market order → using ${usd_amount:.2f} USD "
@@ -66,7 +74,7 @@ def apply_market_order_patch():
 
                 market_order_args = MarketOrderArgs(
                     token_id=get_polymarket_token_id(order.instrument_id),
-                    amount=usd_amount,          # ← USD, not tokens
+                    amount=usd_amount,  # ← USD, not tokens
                     side=order_side_to_str(order.side),
                     order_type=order_type,
                 )
@@ -125,7 +133,9 @@ def apply_market_order_patch():
                     options=options,
                 )
                 interval = self._clock.timestamp() - signing_start
-                self._log.info(f"Signed Polymarket market SELL in {interval:.3f}s", LogColor.BLUE)
+                self._log.info(
+                    f"Signed Polymarket market SELL in {interval:.3f}s", LogColor.BLUE
+                )
 
                 self.generate_order_submitted(
                     strategy_id=order.strategy_id,
@@ -139,7 +149,9 @@ def apply_market_order_patch():
         # Apply the patch
         PolymarketExecutionClient._submit_market_order = _patched_submit_market_order
         _patch_applied = True
-        logger.info("Market order patch applied — BUY orders will use $MARKET_BUY_USD (default $1)")
+        logger.info(
+            "Market order patch applied — BUY orders will use $MARKET_BUY_USD (default $1)"
+        )
         return True
 
     except ImportError as e:
@@ -148,5 +160,6 @@ def apply_market_order_patch():
     except Exception as e:
         logger.error(f"Failed to apply market order patch: {e}")
         import traceback
+
         traceback.print_exc()
         return False

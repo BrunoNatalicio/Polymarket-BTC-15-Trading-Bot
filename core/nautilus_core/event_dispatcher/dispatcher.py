@@ -2,15 +2,19 @@
 Event Dispatcher
 Routes market events to appropriate strategies and components
 """
-from typing import Dict, List, Callable, Any
-from enum import Enum
+
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
+from typing import Any
+
 from loguru import logger
 
 
 class EventType(Enum):
     """Types of events in the system."""
+
     PRICE_UPDATE = "price_update"
     QUOTE_TICK = "quote_tick"
     TRADE_TICK = "trade_tick"
@@ -26,37 +30,38 @@ class EventType(Enum):
 @dataclass
 class Event:
     """Base event class."""
+
     type: EventType
     timestamp: datetime
     source: str
-    data: Dict[str, Any]
+    data: dict[str, Any]
 
 
 class EventDispatcher:
     """
     Central event dispatcher that routes events to subscribers.
-    
+
     Implements pub/sub pattern for loose coupling between components.
     """
-    
+
     def __init__(self):
         """Initialize event dispatcher."""
         # Subscribers: event_type -> list of callbacks
-        self._subscribers: Dict[EventType, List[Callable]] = {
+        self._subscribers: dict[EventType, list[Callable]] = {
             event_type: [] for event_type in EventType
         }
-        
+
         # Event history (for debugging)
-        self._event_history: List[Event] = []
+        self._event_history: list[Event] = []
         self._max_history = 1000
-        
+
         # Statistics
-        self._event_counts: Dict[EventType, int] = {
+        self._event_counts: dict[EventType, int] = {
             event_type: 0 for event_type in EventType
         }
-        
+
         logger.info("Initialized Event Dispatcher")
-    
+
     def subscribe(
         self,
         event_type: EventType,
@@ -64,7 +69,7 @@ class EventDispatcher:
     ) -> None:
         """
         Subscribe to an event type.
-        
+
         Args:
             event_type: Type of event to subscribe to
             callback: Function to call when event occurs
@@ -72,7 +77,7 @@ class EventDispatcher:
         if callback not in self._subscribers[event_type]:
             self._subscribers[event_type].append(callback)
             logger.debug(f"Subscribed to {event_type.value}")
-    
+
     def unsubscribe(
         self,
         event_type: EventType,
@@ -80,7 +85,7 @@ class EventDispatcher:
     ) -> None:
         """
         Unsubscribe from an event type.
-        
+
         Args:
             event_type: Type of event
             callback: Callback to remove
@@ -88,26 +93,26 @@ class EventDispatcher:
         if callback in self._subscribers[event_type]:
             self._subscribers[event_type].remove(callback)
             logger.debug(f"Unsubscribed from {event_type.value}")
-    
+
     def dispatch(self, event: Event) -> None:
         """
         Dispatch event to all subscribers.
-        
+
         Args:
             event: Event to dispatch
         """
         try:
             # Update statistics
             self._event_counts[event.type] += 1
-            
+
             # Add to history
             self._event_history.append(event)
             if len(self._event_history) > self._max_history:
                 self._event_history.pop(0)
-            
+
             # Call all subscribers
             subscribers = self._subscribers.get(event.type, [])
-            
+
             for callback in subscribers:
                 try:
                     callback(event)
@@ -115,91 +120,77 @@ class EventDispatcher:
                     logger.error(
                         f"Error in event subscriber for {event.type.value}: {e}"
                     )
-            
+
             logger.debug(
                 f"Dispatched {event.type.value} to {len(subscribers)} subscribers"
             )
-            
+
         except Exception as e:
             logger.error(f"Error dispatching event: {e}")
-    
+
     def dispatch_price_update(
         self,
         source: str,
         price: float,
-        metadata: Dict[str, Any] = None,
+        metadata: dict[str, Any] = None,
     ) -> None:
         """Convenience method to dispatch price update."""
         event = Event(
             type=EventType.PRICE_UPDATE,
             timestamp=datetime.now(),
             source=source,
-            data={
-                "price": price,
-                **(metadata or {})
-            }
+            data={"price": price, **(metadata or {})},
         )
         self.dispatch(event)
-    
+
     def dispatch_sentiment_update(
         self,
         source: str,
         score: float,
         classification: str,
-        metadata: Dict[str, Any] = None,
+        metadata: dict[str, Any] = None,
     ) -> None:
         """Convenience method to dispatch sentiment update."""
         event = Event(
             type=EventType.SENTIMENT_UPDATE,
             timestamp=datetime.now(),
             source=source,
-            data={
-                "score": score,
-                "classification": classification,
-                **(metadata or {})
-            }
+            data={"score": score, "classification": classification, **(metadata or {})},
         )
         self.dispatch(event)
-    
+
     def dispatch_anomaly(
         self,
         source: str,
         anomaly_type: str,
-        details: Dict[str, Any],
+        details: dict[str, Any],
     ) -> None:
         """Convenience method to dispatch anomaly detection."""
         event = Event(
             type=EventType.ANOMALY_DETECTED,
             timestamp=datetime.now(),
             source=source,
-            data={
-                "anomaly_type": anomaly_type,
-                **details
-            }
+            data={"anomaly_type": anomaly_type, **details},
         )
         self.dispatch(event)
-    
+
     def dispatch_signal(
         self,
         source: str,
         signal_type: str,
         strength: float,
-        metadata: Dict[str, Any] = None,
+        metadata: dict[str, Any] = None,
     ) -> None:
         """Convenience method to dispatch trading signal."""
         event = Event(
             type=EventType.SIGNAL_GENERATED,
             timestamp=datetime.now(),
             source=source,
-            data={
-                "signal_type": signal_type,
-                "strength": strength,
-                **(metadata or {})
-            }
+            data={"signal_type": signal_type, "strength": strength, **(metadata or {})},
         )
         self.dispatch(event)
-    
-    def get_statistics(self) -> Dict[str, Any]:
+
+    def get_statistics(self) -> dict[str, Any]:
         """Get event dispatcher statistics."""
         return {
             "total_events": sum(self._event_counts.values()),
@@ -213,19 +204,19 @@ class EventDispatcher:
             },
             "history_size": len(self._event_history),
         }
-    
+
     def get_recent_events(
         self,
         event_type: EventType = None,
         limit: int = 10,
-    ) -> List[Event]:
+    ) -> list[Event]:
         """
         Get recent events.
-        
+
         Args:
             event_type: Filter by event type (None for all)
             limit: Maximum number of events to return
-            
+
         Returns:
             List of recent events
         """
@@ -233,24 +224,23 @@ class EventDispatcher:
             events = [e for e in self._event_history if e.type == event_type]
         else:
             events = self._event_history
-        
+
         return events[-limit:]
-    
+
     def clear_history(self) -> None:
         """Clear event history."""
         self._event_history.clear()
         logger.info("Cleared event history")
-    
+
     def reset_statistics(self) -> None:
         """Reset event statistics."""
-        self._event_counts = {
-            event_type: 0 for event_type in EventType
-        }
+        self._event_counts = {event_type: 0 for event_type in EventType}
         logger.info("Reset event statistics")
 
 
 # Singleton instance
 _dispatcher_instance = None
+
 
 def get_event_dispatcher() -> EventDispatcher:
     """Get singleton event dispatcher."""
