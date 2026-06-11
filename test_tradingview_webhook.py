@@ -20,6 +20,7 @@ from typing import Any, cast
 
 from tradingview_webhook_receiver import (
     SIGNALS_KEY,
+    TV_SIGNAL_LOG_KEY,
     WebhookHandler,
     build_signal_message,
     get_redis_client,
@@ -151,13 +152,13 @@ def test_redis_roundtrip():
 
 
 class StubRedis:
-    """Records rpush/ltrim calls — no Redis server needed."""
+    """Records rpush/ltrim calls per key — no Redis server needed."""
 
     def __init__(self):
-        self.queue: list[str] = []
+        self.queues: dict[str, list[str]] = {}
 
     def rpush(self, key, value):
-        self.queue.append(value)
+        self.queues.setdefault(key, []).append(value)
 
     def ltrim(self, key, start, end):
         pass
@@ -192,13 +193,19 @@ def test_http_end_to_end():
     try:
         status = post("/webhook", b'{"secret": "test-secret", "signal": "UP"}')
         check("valid alert -> 200", status == 200)
-        check("signal queued in Redis", len(stub.queue) == 1)
-        if stub.queue:
-            msg = json.loads(stub.queue[0])
+        bot_queue = stub.queues.get(SIGNALS_KEY, [])
+        check("signal queued in Redis", len(bot_queue) == 1)
+        if bot_queue:
+            msg = json.loads(bot_queue[0])
             check(
                 "queued message well-formed",
                 msg["signal"] == "UP" and "received_at" in msg and "id" in msg,
             )
+        log_queue = stub.queues.get(TV_SIGNAL_LOG_KEY, [])
+        check(
+            "signal copied to backtest log key",
+            len(log_queue) == 1 and log_queue[0] == bot_queue[0],
+        )
 
         status = post("/webhook", b'{"secret": "WRONG", "signal": "UP"}')
         check("bad secret -> 403", status == 403)
@@ -212,7 +219,11 @@ def test_http_end_to_end():
         status = post("/nope", b'{"secret": "test-secret", "signal": "UP"}')
         check("wrong path -> 404", status == 404)
 
-        check("rejected alerts not queued", len(stub.queue) == 1)
+        check(
+            "rejected alerts not queued",
+            len(stub.queues.get(SIGNALS_KEY, [])) == 1
+            and len(stub.queues.get(TV_SIGNAL_LOG_KEY, [])) == 1,
+        )
 
         req = urllib.request.Request(f"http://127.0.0.1:{port}/health")
         with urllib.request.urlopen(req, timeout=5) as resp:

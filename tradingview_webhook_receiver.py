@@ -39,7 +39,12 @@ from loguru import logger
 load_dotenv()
 
 SIGNALS_KEY = "btc_trading:tradingview_signals"
+# Append-only copy of every accepted signal, drained exclusively by the
+# backtest recorder (python -m backtest record). The bot's BLPOP queue
+# above is never touched by the backtest pipeline.
+TV_SIGNAL_LOG_KEY = "btc_trading:tv_signal_log"
 MAX_QUEUE_LEN = 100
+MAX_SIGNAL_LOG_LEN = 10_000
 MAX_BODY_BYTES = 4096
 VALID_SIGNALS = ("UP", "DOWN")
 
@@ -135,15 +140,23 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._respond(403, "forbidden")
             return
 
+        message = build_signal_message(payload["signal"])
         try:
-            self.redis_client.rpush(
-                SIGNALS_KEY, build_signal_message(payload["signal"])
-            )
+            self.redis_client.rpush(SIGNALS_KEY, message)
             self.redis_client.ltrim(SIGNALS_KEY, -MAX_QUEUE_LEN, -1)
         except Exception as e:
             logger.error(f"Failed to queue signal: {e}")
             self._respond(500, "queue error")
             return
+
+        # Best-effort copy for the backtest recorder. Isolated try/except:
+        # a failure here must never turn a valid webhook into an error or
+        # affect the bot's queue above.
+        try:
+            self.redis_client.rpush(TV_SIGNAL_LOG_KEY, message)
+            self.redis_client.ltrim(TV_SIGNAL_LOG_KEY, -MAX_SIGNAL_LOG_LEN, -1)
+        except Exception:
+            logger.warning("Signal log copy failed (backtest tap); continuing")
 
         logger.info(f"Signal queued: {payload['signal']}")
         self._respond(200, "ok")
