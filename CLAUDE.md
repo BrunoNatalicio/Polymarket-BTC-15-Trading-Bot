@@ -1,6 +1,6 @@
 # Project Rules and Guidelines
 
-> Auto-generated from .context/docs on 2026-06-11T14:18:57.437Z
+> Auto-generated from .context/docs on 2026-06-11T14:43:30.794Z
 
 ## rules-CLAUDE
 

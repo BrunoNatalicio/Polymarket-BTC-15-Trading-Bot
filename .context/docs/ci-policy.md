@@ -31,8 +31,12 @@ Se a venv não existir ou dependências faltarem, o gate bloqueia o commit expli
 - **Gate 1** — dotcontext SSOT: `export-rules` (`.context/docs/rules-CLAUDE.md` → `CLAUDE.md`),
   `sync` e `reverse-sync`. O `.context/` é autoritativo.
 - **Gate 2** — `uv run python .agent/scripts/checklist.py .`:
-  - P0 Security Scan (`.agent/skills/vulnerability-scanner/`) — required; advisório no
-    conteúdo (sempre exit 0 salvo erro de execução), bloqueia apenas em falha do scanner.
+  - P0 Security Scan (`.agent/skills/vulnerability-scanner/`) — required e FAIL-CLOSED
+    (2026-06-11): achados critical/high bloqueiam o commit (exit 1). Cobre: secrets de
+    carteira hardcoded (chave privada 64-hex, credenciais de API/passphrase), `.env`
+    staged ou não-gitignorado, padrões perigosos (eval/exec/shell=True/pickle/SSL off)
+    e `pip-audit` (CVEs conhecidas nas dependências — falha de rede degrada para WARN
+    não-bloqueante). Falso positivo: waiver inline `# sec-allow: <motivo>` na linha.
   - P1 Lint Check (`.agent/skills/lint-and-validate/`) — required; `ruff check .` +
     pyright ESCOPADO aos arquivos type-clean (bot.py tem ~111 erros pré-existentes;
     amplie a lista em `lint_runner.py` conforme os módulos forem limpos).
