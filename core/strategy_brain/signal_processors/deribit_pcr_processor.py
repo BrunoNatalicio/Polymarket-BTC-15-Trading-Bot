@@ -106,9 +106,7 @@ class DeribitPCRProcessor(BaseSignalProcessor):
             if len(parts) < 3:
                 return None
             expiry_str = parts[1]  # e.g. "20FEB26"
-            expiry_dt = datetime.strptime(expiry_str, "%d%b%y").replace(
-                tzinfo=UTC
-            )
+            expiry_dt = datetime.strptime(expiry_str, "%d%b%y").replace(tzinfo=UTC)
             now = datetime.now(UTC)
             dte = (expiry_dt - now).days
             return max(0, dte)

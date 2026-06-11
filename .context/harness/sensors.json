@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "generatedAt": "2026-06-11T02:55:45.496Z",
+  "source": "manual",
+  "stack": {
+    "primaryLanguage": "python",
+    "languages": [
+      "python"
+    ],
+    "frameworks": [
+      "nautilus_trader"
+    ],
+    "buildTools": [
+      "uv"
+    ],
+    "testFrameworks": [],
+    "packageManager": "uv"
+  },
+  "sensors": [
+    {
+      "id": "lint",
+      "name": "Lint",
+      "description": "Check code style and lint errors with ruff",
+      "severity": "high",
+      "command": "uv run ruff check ."
+    },
+    {
+      "id": "format",
+      "name": "Format check",
+      "description": "Check code formatting with ruff",
+      "severity": "medium",
+      "command": "uv run ruff format --check ."
+    },
+    {
+      "id": "typecheck",
+      "name": "Type check",
+      "description": "Run static type checking with pyright",
+      "severity": "high",
+      "command": "uv run pyright"
+    },
+    {
+      "id": "test-data-sources",
+      "name": "Data sources test",
+      "description": "Phase 1: validate Binance/Coinbase/Deribit/Fear&Greed data source adapters",
+      "severity": "critical",
+      "command": "uv run python data_sources/test.py"
+    },
+    {
+      "id": "test-ingestion",
+      "name": "Ingestion test",
+      "description": "Phase 2: validate data ingestion and normalization pipeline",
+      "severity": "critical",
+      "command": "uv run python core/ingestion/test_ingestion.py"
+    },
+    {
+      "id": "test-nautilus",
+      "name": "NautilusTrader core test",
+      "description": "Phase 3: validate NautilusTrader integration and startup patches",
+      "severity": "critical",
+      "command": "uv run python core/nautilus_core/test_nautilus.py"
+    },
+    {
+      "id": "test-strategy",
+      "name": "Strategy brain test",
+      "description": "Phase 4-5: validate signal processors and SignalFusionEngine",
+      "severity": "critical",
+      "command": "uv run python core/strategy_brain/test_strategy.py"
+    },
+    {
+      "id": "test-execution",
+      "name": "Execution test",
+      "description": "Phase 6-7: validate risk engine ($1 cap, SL/TP) and order execution lifecycle",
+      "severity": "critical",
+      "command": "uv run python execution/test_execution.py"
+    },
+    {
+      "id": "test-tradingview-webhook",
+      "name": "TradingView webhook test",
+      "description": "Validate webhook secret validation, signal TTL, dedup, and dry-run fidelity",
+      "severity": "critical",
+      "command": "uv run python test_tradingview_webhook.py"
+    },
+    {
+      "id": "audit",
+      "name": "Dependency audit",
+      "description": "Scan dependencies for known vulnerabilities",
+      "severity": "medium",
+      "command": "uv run pip-audit"
+    }
+  ]
+}

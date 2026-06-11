@@ -174,6 +174,107 @@ python redis_control.py sim -- not stable yet
 ```
 python redis_control.py live --not stable yet
 ``` 
+## 📡 TradingView Webhook Strategy
+
+Alternative strategy where trades are triggered exclusively by TradingView alerts
+(your indicator decides entries; the bot only applies risk checks and executes).
+Only one strategy runs at a time — a Redis key picks which one.
+
+### How it works
+
+```text
+TradingView alert ──HTTPS──> tunnel ──> tradingview_webhook_receiver.py (port 8001)
+                                              │ RPUSH
+                                              ▼
+                                 Redis list btc_trading:tradingview_signals
+                                              │ BLPOP
+                                              ▼
+                              bot.py (risk check → paper/real order)
+```
+
+The receiver is a **separate process** on purpose: `15m_bot_runner.py` restarts
+`bot.py` periodically, and the tunnel must keep pointing at a stable endpoint.
+
+Rules enforced by the bot:
+- Executes **immediately** when the alert arrives (no trade-window wait)
+- Signals older than 30s are discarded (`TRADINGVIEW_SIGNAL_TTL_SECONDS`)
+- Max **1 trade per 15-minute market** (Redis-backed, survives bot restarts)
+- Same risk engine limits ($1/trade, max 5 positions, $10 exposure)
+- Same sim/live gate (`redis_control.py sim` / `live`)
+
+### Setup
+
+1. Add to `.env`:
+```
+TRADINGVIEW_WEBHOOK_PORT=8001
+TRADINGVIEW_WEBHOOK_SECRET=<long-random-string>
+TRADINGVIEW_SIGNAL_CONFIDENCE=0.75
+TRADINGVIEW_SIGNAL_TTL_SECONDS=30
+```
+
+2. Start the receiver (its own terminal, keep it running):
+```
+uv run python tradingview_webhook_receiver.py
+```
+
+3. Expose it with a tunnel:
+```
+cloudflared tunnel --url http://localhost:8001
+# or: ngrok http 8001
+```
+⚠️ Quick-tunnel URLs change on every restart — use a named Cloudflare tunnel or
+a paid ngrok domain for a stable hostname, otherwise update the alert URL each time.
+
+4. In TradingView, create one alert per direction on your indicator:
+   - **Webhook URL**: `https://<tunnel-host>/webhook`
+   - **Message** (exactly this JSON):
+```json
+{"secret": "YOUR_SECRET", "signal": "UP"}
+```
+```json
+{"secret": "YOUR_SECRET", "signal": "DOWN"}
+```
+
+5. Activate the strategy and run the bot:
+```
+uv run python redis_control.py strategy tradingview
+uv run python 15m_bot_runner.py --test-mode   # or --live
+```
+
+Switch back to the internal fusion strategy anytime:
+```
+uv run python redis_control.py strategy fusion
+```
+
+### Dry run (100% live fidelity, zero risk)
+
+```
+uv run python redis_control.py dryrun on    # enable
+uv run python redis_control.py dryrun off   # disable
+```
+
+With dry run ON, a webhook signal runs the **exact live order path** — secret,
+TTL, dedup, risk engine, liquidity guard, YES/NO token resolution, instrument
+cache lookup, quantity/precision math, and order construction. It diverges from
+live at a **single point**: `submit_order` is not called. The would-be order is
+logged and appended to `tv_dry_run_trades.json` (timestamp, direction, price,
+qty, order id, market slug) so you can validate the indicator against real
+market outcomes before going live.
+
+Notes:
+- Dry run takes precedence over sim/live mode for webhook trades
+- Dedup still applies (max 1 per 15-min market) — it rehearses real behavior
+- It only affects the TradingView strategy; the fusion path is untouched
+
+### Test locally (no TradingView needed)
+
+```
+curl -X POST http://localhost:8001/webhook -d "{\"secret\":\"YOUR_SECRET\",\"signal\":\"UP\"}"
+```
+Expected: receiver logs `Signal queued: UP` → bot logs `TRADINGVIEW SIGNAL TRADE` →
+paper trade recorded (see `view_paper_trades.py`). A second POST in the same
+15-minute market is ignored (`already traded market`).
+
 ## 📁 Project Structure
 
 ```text

@@ -11,6 +11,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Windows consoles with legacy codepages (cp1252) can't print the emoji
+# used below; replace unencodable chars instead of crashing.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+except Exception:
+    pass
+
 
 def get_redis_client():
     """Get Redis client."""
@@ -54,9 +61,54 @@ def set_simulation_mode(client, simulation: bool):
         return False
 
 
+def get_active_strategy(client):
+    """Get active strategy ('fusion' or 'tradingview'). Defaults to 'fusion'."""
+    try:
+        value = client.get("btc_trading:active_strategy")
+        if value in ("fusion", "tradingview"):
+            return value
+        return None
+    except Exception as e:
+        print(f"✗ Error reading strategy: {e}")
+        return None
+
+
+def set_active_strategy(client, strategy: str):
+    """Set active strategy."""
+    try:
+        client.set("btc_trading:active_strategy", strategy)
+        print(f"✓ Active strategy set to: {strategy.upper()}")
+        return True
+    except Exception as e:
+        print(f"✗ Error setting strategy: {e}")
+        return False
+
+
+def get_tv_dry_run(client):
+    """Get TradingView dry-run flag (True/False)."""
+    try:
+        return client.get("btc_trading:tv_dry_run") == "1"
+    except Exception as e:
+        print(f"✗ Error reading dry-run flag: {e}")
+        return False
+
+
+def set_tv_dry_run(client, enabled: bool):
+    """Set TradingView dry-run flag."""
+    try:
+        client.set("btc_trading:tv_dry_run", "1" if enabled else "0")
+        print(f"✓ TradingView dry run: {'ON' if enabled else 'OFF'}")
+        return True
+    except Exception as e:
+        print(f"✗ Error setting dry-run flag: {e}")
+        return False
+
+
 def display_status(client):
     """Display current status."""
     mode = get_current_mode(client)
+    strategy = get_active_strategy(client)
+    tv_dry_run = get_tv_dry_run(client)
 
     print("\n" + "=" * 60)
     print("BTC BOT - CURRENT STATUS")
@@ -72,6 +124,20 @@ def display_status(client):
         print("Status: 🔴 LIVE TRADING MODE")
         print("  - REAL MONEY AT RISK!")
         print("  - Real orders will be placed")
+
+    if strategy is None:
+        print("Strategy: FUSION (default — key absent)")
+    elif strategy == "tradingview":
+        print("Strategy: 📡 TRADINGVIEW WEBHOOK")
+        print("  - Trades triggered only by TradingView alerts")
+    else:
+        print("Strategy: 🧠 FUSION (internal signal processors)")
+
+    if tv_dry_run:
+        print("TV Dry Run: 🔵 ON")
+        print("  - Webhook trades run the FULL live order path")
+        print("  - Order is built/validated but NEVER submitted")
+        print("  - Records go to tv_dry_run_trades.json")
 
     print("=" * 60 + "\n")
 
@@ -108,6 +174,38 @@ def main():
             else:
                 print("Cancelled.")
 
+        elif command == "strategy":
+            target = sys.argv[2].lower() if len(sys.argv) > 2 else None
+            if target == "fusion":
+                print("Switching to FUSION strategy...")
+                set_active_strategy(client, "fusion")
+                display_status(client)
+            elif target == "tradingview":
+                mode = get_current_mode(client)
+                if mode is False:
+                    print("\n⚠️  WARNING: Bot is in LIVE TRADING mode!")
+                    print("TradingView alerts will trigger REAL trades.")
+                    confirm = input("Type 'yes' to confirm: ")
+                    if confirm.lower() != "yes":
+                        print("Cancelled.")
+                        return
+                print("Switching to TRADINGVIEW strategy...")
+                set_active_strategy(client, "tradingview")
+                display_status(client)
+            else:
+                print("Usage: python redis_control.py strategy [fusion|tradingview]")
+
+        elif command == "dryrun":
+            target = sys.argv[2].lower() if len(sys.argv) > 2 else None
+            if target in ["on", "1"]:
+                set_tv_dry_run(client, True)
+                display_status(client)
+            elif target in ["off", "0"]:
+                set_tv_dry_run(client, False)
+                display_status(client)
+            else:
+                print("Usage: python redis_control.py dryrun [on|off]")
+
         elif command in ["status", "check"]:
             # Already displayed above
             pass
@@ -118,6 +216,15 @@ def main():
             print("  python redis_control.py sim       - Enable simulation mode")
             print("  python redis_control.py live      - Enable live trading")
             print("  python redis_control.py status    - Show current status")
+            print("  python redis_control.py strategy [fusion|tradingview]")
+            print("                                    - Switch active strategy")
+            print("  python redis_control.py dryrun [on|off]")
+            print(
+                "                                    - TradingView dry run (live path,"
+            )
+            print(
+                "                                      order built but not submitted)"
+            )
     else:
         # Interactive mode
         print("Commands:")

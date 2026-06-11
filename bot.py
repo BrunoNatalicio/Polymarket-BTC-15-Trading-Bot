@@ -57,6 +57,12 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.trading.strategy import Strategy
 
 from core.strategy_brain.fusion_engine.signal_fusion import get_fusion_engine
+from core.strategy_brain.signal_processors.base_processor import (
+    SignalDirection,
+    SignalStrength,
+    SignalType,
+    TradingSignal,
+)
 from core.strategy_brain.signal_processors.deribit_pcr_processor import (
     DeribitPCRProcessor,
 )
@@ -251,6 +257,12 @@ class IntegratedBTCStrategy(Strategy):
 
         self.test_mode = test_mode
 
+        # TradingView webhook strategy (exclusive mode via Redis key
+        # btc_trading:active_strategy — "fusion" is the default)
+        self.active_strategy = "fusion"
+        self._tv_confidence = float(os.getenv("TRADINGVIEW_SIGNAL_CONFIDENCE", "0.75"))
+        self._tv_signal_ttl = float(os.getenv("TRADINGVIEW_SIGNAL_TTL_SECONDS", "30"))
+
         if test_mode:
             logger.info("=" * 80)
             logger.info("  TEST MODE ACTIVE - Trading every minute!")
@@ -322,6 +334,38 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"Failed to check Redis simulation mode: {e}")
         return self.current_simulation_mode
 
+    def get_active_strategy(self) -> str:
+        """Check Redis for the active strategy ('fusion' or 'tradingview')."""
+        if not self.redis_client:
+            return self.active_strategy
+        try:
+            value = self.redis_client.get("btc_trading:active_strategy")
+            strategy = value if value in ("fusion", "tradingview") else "fusion"
+            if strategy != self.active_strategy:
+                logger.warning(f"Active strategy changed to: {strategy.upper()}")
+                self.active_strategy = strategy
+            return strategy
+        except Exception as e:
+            logger.warning(f"Failed to check Redis active strategy: {e}")
+            return self.active_strategy
+
+    def check_tv_dry_run(self) -> bool:
+        """
+        Check Redis for the TradingView dry-run flag.
+
+        In dry run the full webhook pipeline runs (secret, TTL, dedup, risk,
+        liquidity) but NO order is placed — not even a paper trade. The
+        would-be trade is logged and appended to tv_dry_run_trades.json so
+        the indicator can be validated against real market outcomes.
+        """
+        if not self.redis_client:
+            return False
+        try:
+            return self.redis_client.get("btc_trading:tv_dry_run") == "1"
+        except Exception as e:
+            logger.warning(f"Failed to check Redis tv_dry_run: {e}")
+            return False
+
     # ------------------------------------------------------------------
     # Strategy lifecycle
     # ------------------------------------------------------------------
@@ -364,6 +408,10 @@ class IntegratedBTCStrategy(Strategy):
         # FIX 4: Start the timer loop (but don't rely on it for trading)
         # =========================================================================
         self.run_in_executor(self._start_timer_loop)
+
+        # TradingView webhook consumer (signals queued by tradingview_webhook_receiver.py)
+        if self.redis_client:
+            self.run_in_executor(self._start_webhook_consumer)
 
         if self.grafana_exporter:
             import threading
@@ -880,6 +928,220 @@ class IntegratedBTCStrategy(Strategy):
         finally:
             loop.close()
 
+    # ------------------------------------------------------------------
+    # TradingView webhook strategy
+    # ------------------------------------------------------------------
+
+    def _start_webhook_consumer(self):
+        """
+        Consume TradingView signals from Redis (runs in an executor thread).
+
+        Signals are queued by tradingview_webhook_receiver.py (separate
+        process). BLPOP wakes within milliseconds of a new signal, so
+        "execute immediately" is met without polling.
+        """
+        redis_client = self.redis_client
+        if redis_client is None:
+            return
+        logger.info(
+            "TradingView webhook consumer started "
+            "(BLPOP btc_trading:tradingview_signals)"
+        )
+        while True:
+            try:
+                item = redis_client.blpop("btc_trading:tradingview_signals", timeout=5)
+                if item is None:
+                    continue
+                self._handle_tradingview_signal(item[1])
+            except Exception as e:
+                logger.error(f"Webhook consumer error: {e}")
+                time.sleep(2)
+
+    def _handle_tradingview_signal(self, raw: str):
+        """Validate and execute one queued TradingView signal."""
+        import json
+
+        redis_client = self.redis_client
+        if redis_client is None:
+            return
+
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"TV signal unparseable, dropped: {raw!r}")
+            return
+
+        signal = payload.get("signal")
+        age = time.time() - float(payload.get("received_at", 0))
+
+        # Strategy exclusivity: drain but ignore while fusion is active
+        if self.get_active_strategy() != "tradingview":
+            logger.info(f"TV signal {signal} IGNORED — fusion strategy active")
+            return
+
+        if age > self._tv_signal_ttl:
+            logger.warning(
+                f"TV signal {signal} DISCARDED — stale "
+                f"({age:.1f}s > {self._tv_signal_ttl:.0f}s)"
+            )
+            return
+
+        if signal not in ("UP", "DOWN"):
+            logger.warning(f"TV signal invalid, dropped: {signal!r}")
+            return
+
+        if (
+            self._waiting_for_market_open
+            or self.current_instrument_index < 0
+            or self.current_instrument_index >= len(self.all_btc_instruments)
+        ):
+            logger.warning(f"TV signal {signal} DISCARDED — no active market")
+            return
+
+        # One trade per 15-min market. Dedup key lives in Redis so the
+        # 90-min auto-restart can't cause a double trade in the same market.
+        current_market = self.all_btc_instruments[self.current_instrument_index]
+        market_start_ts = current_market["market_timestamp"]
+        elapsed_secs = time.time() - market_start_ts
+        if elapsed_secs < 0:
+            logger.warning(f"TV signal {signal} DISCARDED — market not open yet")
+            return
+        sub_interval = int(elapsed_secs // MARKET_INTERVAL_SECONDS)
+        dedup_value = f"{market_start_ts}:{sub_interval}"
+        try:
+            already_traded = redis_client.get("btc_trading:tv_last_traded_market")
+        except Exception as e:
+            logger.error(
+                f"TV signal {signal} DISCARDED — Redis dedup check failed: {e}"
+            )
+            return
+        if already_traded == dedup_value:
+            logger.info(
+                f"TV signal {signal} IGNORED — already traded market {dedup_value}"
+            )
+            return
+
+        last_tick = getattr(self, "_last_bid_ask", None)
+        if not last_tick:
+            logger.warning(f"TV signal {signal} DISCARDED — no quote yet for market")
+            return
+        mid_price = (last_tick[0] + last_tick[1]) / 2
+
+        # Claim the market before executing (consumer is single-threaded)
+        redis_client.set("btc_trading:tv_last_traded_market", dedup_value, ex=3600)
+
+        logger.info("=" * 80)
+        logger.info(
+            f" TRADINGVIEW SIGNAL TRADE: {signal} | age {age:.1f}s | "
+            f"price ${float(mid_price):.4f} | market {current_market['slug']}"
+        )
+        logger.info("=" * 80)
+
+        self._execute_webhook_trade_sync(
+            signal, float(mid_price), current_market.get("slug", "")
+        )
+
+    def _execute_webhook_trade_sync(
+        self, signal: str, current_price: float, market_slug: str = ""
+    ):
+        """Synchronous wrapper (consumer thread owns its own event loop)."""
+        price_decimal = Decimal(str(current_price))
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(
+                self._execute_webhook_trade(signal, price_decimal, market_slug)
+            )
+        finally:
+            loop.close()
+
+    async def _execute_webhook_trade(
+        self, signal: str, current_price: Decimal, market_slug: str = ""
+    ):
+        """
+        Execute a TradingView signal directly — no fusion, no trend filter.
+
+        The TradingView indicator owns the entry decision; this path only
+        applies the risk engine, the liquidity guard, and the sim/live gate
+        (identical to the tail of _make_trading_decision).
+
+        Dry run (btc_trading:tv_dry_run = "1"): runs the EXACT live order
+        path — token resolution, instrument cache, qty/precision, order
+        construction — and diverges at a single point: submit_order is not
+        called. 100% fidelity with live except the submission itself.
+        """
+        is_simulation = await self.check_simulation_mode()
+        tv_dry_run = self.check_tv_dry_run()
+        if tv_dry_run:
+            logger.info("Mode: DRY RUN (live order path, submission skipped)")
+        else:
+            logger.info(f"Mode: {'SIMULATION' if is_simulation else 'LIVE TRADING'}")
+
+        # UP = buy YES token ("long"), DOWN = buy NO token ("short")
+        direction = "long" if signal == "UP" else "short"
+
+        tv_signal = TradingSignal(
+            timestamp=datetime.now(UTC),
+            source="TradingViewWebhook",
+            signal_type=SignalType.MOMENTUM,
+            direction=SignalDirection.BULLISH
+            if signal == "UP"
+            else SignalDirection.BEARISH,
+            strength=SignalStrength.STRONG,
+            confidence=self._tv_confidence,
+            current_price=current_price,
+        )
+
+        POSITION_SIZE_USD = Decimal("1.00")
+        is_valid, error = self.risk_engine.validate_new_position(
+            size=POSITION_SIZE_USD,
+            direction=direction,
+            current_price=current_price,
+        )
+        if not is_valid:
+            logger.warning(f"Risk engine blocked TradingView trade: {error}")
+            return
+
+        logger.info(f"Position size: $1.00 (fixed) | Direction: {direction.upper()}")
+
+        # Liquidity guard — same thresholds as the fusion path, but no retry
+        # semantics (a webhook signal fires once; we don't re-arm the window)
+        last_tick = getattr(self, "_last_bid_ask", None)
+        if last_tick:
+            last_bid, last_ask = last_tick
+            MIN_LIQUIDITY = Decimal("0.02")
+            if direction == "long" and last_ask <= MIN_LIQUIDITY:
+                logger.warning(
+                    f"⚠ No liquidity for BUY: ask=${float(last_ask):.4f} — "
+                    "skipping TradingView trade"
+                )
+                return
+            if direction == "short" and last_bid <= MIN_LIQUIDITY:
+                logger.warning(
+                    f"⚠ No liquidity for SELL: bid=${float(last_bid):.4f} — "
+                    "skipping TradingView trade"
+                )
+                return
+
+        if tv_dry_run:
+            # Dry run takes precedence over sim/live: rehearse the live path
+            await self._place_real_order(
+                tv_signal,
+                POSITION_SIZE_USD,
+                current_price,
+                direction,
+                dry_run=True,
+                market_slug=market_slug,
+            )
+        elif is_simulation:
+            await self._record_paper_trade(
+                tv_signal, POSITION_SIZE_USD, current_price, direction
+            )
+        else:
+            await self._place_real_order(
+                tv_signal, POSITION_SIZE_USD, current_price, direction
+            )
+
     async def _fetch_market_context(self, current_price: Decimal) -> dict:
         """
         Fetch REAL external data to populate signal processor metadata.
@@ -976,6 +1238,11 @@ class IntegratedBTCStrategy(Strategy):
         calculation needed. The risk engine is still used to check that we
         don't already have too many open positions.
         """
+        # --- Strategy exclusivity: skip fusion path when TradingView is active ---
+        if self.get_active_strategy() != "fusion":
+            logger.info("Fusion decision SKIPPED — TradingView strategy active")
+            return
+
         # --- Mode check ---
         is_simulation = await self.check_simulation_mode()
         logger.info(f"Mode: {'SIMULATION' if is_simulation else 'LIVE TRADING'}")
@@ -1181,7 +1448,20 @@ class IntegratedBTCStrategy(Strategy):
     # Real order (unchanged)
     # ------------------------------------------------------------------
 
-    async def _place_real_order(self, signal, position_size, current_price, direction):
+    async def _place_real_order(
+        self,
+        signal,
+        position_size,
+        current_price,
+        direction,
+        dry_run: bool = False,
+        market_slug: str = "",
+    ):
+        """
+        Place a real order. With dry_run=True the ENTIRE path runs identically
+        (token resolution, instrument cache, qty/precision, order construction)
+        and diverges at exactly one point: submit_order is not called.
+        """
         if not self.instrument_id:
             logger.error("No instrument available")
             return
@@ -1190,7 +1470,10 @@ class IntegratedBTCStrategy(Strategy):
             # instrument is fetched below after determining YES vs NO token
 
             logger.info("=" * 80)
-            logger.info("LIVE MODE - PLACING REAL ORDER!")
+            if dry_run:
+                logger.info("DRY RUN - LIVE ORDER PATH (submission will be skipped)")
+            else:
+                logger.info("LIVE MODE - PLACING REAL ORDER!")
             logger.info("=" * 80)
 
             # On Polymarket, both UP and DOWN are BUY orders.
@@ -1250,6 +1533,30 @@ class IntegratedBTCStrategy(Strategy):
                 time_in_force=TimeInForce.IOC,
             )
 
+            # SINGLE DIVERGENCE POINT between dry run and live: the order was
+            # built and validated identically; dry run only skips submission.
+            if dry_run:
+                logger.info("DRY RUN - ORDER BUILT AND VALIDATED, NOT SUBMITTED")
+                logger.info(f"  Order ID: {unique_id}")
+                logger.info(f"  Direction: {trade_label}")
+                logger.info("  Side: BUY")
+                logger.info(f"  Token Quantity: {token_qty:.6f}")
+                logger.info(f"  Estimated Cost: ~${max_usd_amount:.2f}")
+                logger.info(f"  Price: ${trade_price:.4f}")
+                logger.info("=" * 80)
+                self._record_tv_dry_run_trade(
+                    signal=signal,
+                    direction=direction,
+                    trade_label=trade_label,
+                    price=trade_price,
+                    usd_amount=max_usd_amount,
+                    token_qty=token_qty,
+                    order_id=unique_id,
+                    instrument_id=str(trade_instrument_id),
+                    market_slug=market_slug,
+                )
+                return
+
             self.submit_order(order)
 
             logger.info("REAL ORDER SUBMITTED!")
@@ -1268,7 +1575,49 @@ class IntegratedBTCStrategy(Strategy):
             import traceback
 
             traceback.print_exc()
-            self._track_order_event("rejected")
+            if not dry_run:
+                self._track_order_event("rejected")
+
+    def _record_tv_dry_run_trade(
+        self,
+        signal,
+        direction: str,
+        trade_label: str,
+        price: float,
+        usd_amount: float,
+        token_qty: float,
+        order_id: str,
+        instrument_id: str,
+        market_slug: str,
+    ):
+        """Append a dry-run trade record to tv_dry_run_trades.json."""
+        import json
+
+        record = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "source": getattr(signal, "source", "TradingViewWebhook"),
+            "signal_direction": str(getattr(signal, "direction", "")),
+            "signal_confidence": getattr(signal, "confidence", None),
+            "direction": direction,
+            "trade_label": trade_label,
+            "price": price,
+            "usd_amount": usd_amount,
+            "token_qty": token_qty,
+            "order_id": order_id,
+            "instrument_id": instrument_id,
+            "market_slug": market_slug,
+        }
+        try:
+            trades = []
+            if os.path.exists("tv_dry_run_trades.json"):
+                with open("tv_dry_run_trades.json") as f:
+                    trades = json.load(f)
+            trades.append(record)
+            with open("tv_dry_run_trades.json", "w") as f:
+                json.dump(trades, f, indent=2)
+            logger.info(f"Dry-run trade recorded ({len(trades)} total)")
+        except Exception as e:
+            logger.error(f"Failed to record dry-run trade: {e}")
 
     # ------------------------------------------------------------------
     # Signal processing

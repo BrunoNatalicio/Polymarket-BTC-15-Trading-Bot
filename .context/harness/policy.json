@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "defaultEffect": "allow",
+  "rules": [
+    {
+      "id": "protect-repository-core",
+      "effect": "require_approval",
+      "when": {
+        "paths": [
+          "15m_bot_runner.py",
+          "bot.py",
+          "main.py",
+          "patch_gamma_markets.py",
+          "patch_market_orders.py",
+          "redis_control.py",
+          "test.py",
+          "test_tradingview_webhook.py",
+          "tradingview_webhook_receiver.py",
+          "view_paper_trades.py"
+        ],
+        "risk": "high"
+      },
+      "reason": "High-risk changes to core python paths require approval."
+    },
+    {
+      "id": "protect-repository-config",
+      "effect": "require_approval",
+      "when": {
+        "paths": [
+          "pyproject.toml",
+          "requirements.txt"
+        ],
+        "risk": "high"
+      },
+      "reason": "High-risk changes to repository automation and build configuration require approval."
+    },
+    {
+      "id": "block-secrets",
+      "effect": "deny",
+      "when": {
+        "paths": [
+          "**/.env*",
+          "**/*.pem",
+          "**/*.key",
+          "**/*secret*"
+        ]
+      },
+      "reason": "Secret-like files are blocked by policy."
+    }
+  ]
+}

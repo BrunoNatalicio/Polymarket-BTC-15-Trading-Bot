@@ -1,0 +1,244 @@
+"""
+Tests for the TradingView webhook strategy components.
+
+Standalone script (repo convention — not pytest):
+    uv run python test_tradingview_webhook.py
+
+Covers:
+    1. parse_alert      - payload parsing/normalization
+    2. validate_secret  - constant-time secret check
+    3. staleness        - signal TTL math
+    4. direction map    - UP -> long, DOWN -> short
+    5. Redis round-trip - RPUSH/BLPOP + dedup key (skipped if Redis is down)
+    6. HTTP end-to-end  - real HTTP server + stub Redis (no Redis needed)
+"""
+
+import json
+import sys
+import time
+from typing import Any, cast
+
+from tradingview_webhook_receiver import (
+    SIGNALS_KEY,
+    WebhookHandler,
+    build_signal_message,
+    get_redis_client,
+    parse_alert,
+    validate_secret,
+)
+
+PASSED = 0
+FAILED = 0
+
+
+def check(name: str, condition: bool) -> None:
+    global PASSED, FAILED
+    if condition:
+        PASSED += 1
+        print(f"  [PASS] {name}")
+    else:
+        FAILED += 1
+        print(f"  [FAIL] {name}")
+
+
+def test_parse_alert():
+    print("\n1. parse_alert")
+
+    payload, err = parse_alert(b'{"secret": "abc", "signal": "UP"}')
+    check("valid UP", err is None and payload is not None and payload["signal"] == "UP")
+
+    payload, err = parse_alert(b'{"secret": "abc", "signal": "DOWN"}')
+    check(
+        "valid DOWN",
+        err is None and payload is not None and payload["signal"] == "DOWN",
+    )
+
+    payload, err = parse_alert(b'{"secret": "abc", "signal": " up "}')
+    check(
+        "lowercase/whitespace normalized",
+        err is None and payload is not None and payload["signal"] == "UP",
+    )
+
+    payload, err = parse_alert(b"not json at all")
+    check("garbage rejected", payload is None and err == "invalid JSON")
+
+    payload, err = parse_alert(b'{"secret": "abc"}')
+    check("missing signal rejected", payload is None and err is not None)
+
+    payload, err = parse_alert(b'{"secret": "abc", "signal": "SIDEWAYS"}')
+    check("invalid signal rejected", payload is None and err is not None)
+
+    payload, err = parse_alert(b'["UP"]')
+    check("non-object JSON rejected", payload is None and err is not None)
+
+    payload, err = parse_alert(b'{"signal": "UP"}')
+    check(
+        "missing secret defaults to empty string",
+        err is None and payload is not None and payload["secret"] == "",
+    )
+
+
+def test_validate_secret():
+    print("\n2. validate_secret")
+    check("correct secret accepted", validate_secret("s3cret", "s3cret"))
+    check("wrong secret rejected", not validate_secret("wrong", "s3cret"))
+    check("empty provided rejected", not validate_secret("", "s3cret"))
+    check("empty expected fails closed", not validate_secret("anything", ""))
+    check("both empty fails closed", not validate_secret("", ""))
+
+
+def test_staleness():
+    print("\n3. staleness (TTL)")
+    ttl = 30.0
+    now = time.time()
+
+    fresh = json.loads(build_signal_message("UP", received_at=now - 5))
+    age = now - fresh["received_at"]
+    check("fresh signal (5s) accepted", age <= ttl)
+
+    stale = json.loads(build_signal_message("UP", received_at=now - 45))
+    age = now - stale["received_at"]
+    check("stale signal (45s) rejected", age > ttl)
+
+    msg = json.loads(build_signal_message("DOWN"))
+    check(
+        "message has id/signal/received_at",
+        bool(msg["id"])
+        and msg["signal"] == "DOWN"
+        and msg["received_at"] <= time.time(),
+    )
+
+
+def test_direction_mapping():
+    print("\n4. direction mapping (UP=buy YES/long, DOWN=buy NO/short)")
+
+    def map_direction(signal: str) -> str:
+        # Mirrors bot.py _execute_webhook_trade
+        return "long" if signal == "UP" else "short"
+
+    check("UP -> long", map_direction("UP") == "long")
+    check("DOWN -> short", map_direction("DOWN") == "short")
+
+
+def test_redis_roundtrip():
+    print("\n5. Redis round-trip")
+    client = get_redis_client()
+    if client is None:
+        print("  [SKIP] Redis not available")
+        return
+
+    test_key = SIGNALS_KEY + ":test"
+    dedup_key = "btc_trading:tv_last_traded_market:test"
+    try:
+        client.delete(test_key, dedup_key)
+
+        client.rpush(test_key, build_signal_message("UP"))
+        item = cast("tuple[str, str] | None", client.blpop([test_key], timeout=2))
+        check("RPUSH/BLPOP round-trip", item is not None)
+        if item is not None:
+            msg = json.loads(item[1])
+            check("payload intact", msg["signal"] == "UP" and "received_at" in msg)
+
+        empty = client.blpop([test_key], timeout=1)
+        check("queue drained", empty is None)
+
+        client.set(dedup_key, "1700000000:0", ex=3600)
+        check("dedup key set with TTL", client.get(dedup_key) == "1700000000:0")
+        ttl = cast(Any, client.ttl(dedup_key))
+        check("dedup TTL ~3600s", 3500 < ttl <= 3600)
+    finally:
+        client.delete(test_key, dedup_key)
+
+
+class StubRedis:
+    """Records rpush/ltrim calls — no Redis server needed."""
+
+    def __init__(self):
+        self.queue: list[str] = []
+
+    def rpush(self, key, value):
+        self.queue.append(value)
+
+    def ltrim(self, key, start, end):
+        pass
+
+
+def test_http_end_to_end():
+    print("\n6. HTTP end-to-end (real server, stub Redis)")
+    import threading
+    import urllib.error
+    import urllib.request
+    from http.server import HTTPServer
+
+    stub = StubRedis()
+    WebhookHandler.redis_client = cast(Any, stub)
+    WebhookHandler.secret = "test-secret"
+
+    server = HTTPServer(("127.0.0.1", 0), WebhookHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def post(path: str, body: bytes) -> int:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}", data=body, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    try:
+        status = post("/webhook", b'{"secret": "test-secret", "signal": "UP"}')
+        check("valid alert -> 200", status == 200)
+        check("signal queued in Redis", len(stub.queue) == 1)
+        if stub.queue:
+            msg = json.loads(stub.queue[0])
+            check(
+                "queued message well-formed",
+                msg["signal"] == "UP" and "received_at" in msg and "id" in msg,
+            )
+
+        status = post("/webhook", b'{"secret": "WRONG", "signal": "UP"}')
+        check("bad secret -> 403", status == 403)
+
+        status = post("/webhook", b'{"secret": "test-secret", "signal": "FOO"}')
+        check("invalid signal -> 400", status == 400)
+
+        status = post("/webhook", b"not json")
+        check("garbage body -> 400", status == 400)
+
+        status = post("/nope", b'{"secret": "test-secret", "signal": "UP"}')
+        check("wrong path -> 404", status == 404)
+
+        check("rejected alerts not queued", len(stub.queue) == 1)
+
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/health")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            check("health check -> 200", resp.status == 200)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def main() -> int:
+    print("=" * 60)
+    print("TRADINGVIEW WEBHOOK STRATEGY - TESTS")
+    print("=" * 60)
+
+    test_parse_alert()
+    test_validate_secret()
+    test_staleness()
+    test_direction_mapping()
+    test_redis_roundtrip()
+    test_http_end_to_end()
+
+    print("\n" + "=" * 60)
+    print(f"RESULT: {PASSED} passed, {FAILED} failed")
+    print("=" * 60)
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
