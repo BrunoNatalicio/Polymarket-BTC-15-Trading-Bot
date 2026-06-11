@@ -70,6 +70,7 @@ htmlcov/
 
 # Trade data (personal financial records)
 paper_trades.json
+tv_dry_run_trades.json
 trades.json
 trade_history.json
 *.trade
@@ -82,6 +83,9 @@ nautilus_logs/
 # Bot state files
 bot_state.json
 last_trade.json
+
+# Backtest replay engine data (orderbook snapshots + signals — collected gold)
+backtest/data/
 
 # Performance data
 performance/
