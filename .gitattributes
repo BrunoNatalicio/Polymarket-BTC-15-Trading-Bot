@@ -1,0 +1,2 @@
+# Hooks bash precisam de LF (Git Bash não executa hooks com CRLF corretamente)
+.githooks/* text eol=lf

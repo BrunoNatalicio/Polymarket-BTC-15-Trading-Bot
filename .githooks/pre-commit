@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+
+# Ativa a venv para que subprocessos (ruff, pyright, python) usem o Python do projeto.
+# Em Linux/macOS o caminho seria .venv/bin
+export PATH="$(pwd)/.venv/Scripts:$PATH"
+export PYTHONUTF8=1
+
+echo "========================================="
+echo "MAESTRO HARNESS PRE-COMMIT GATE"
+echo "========================================="
+
+# Gate 0: pin de versao do Python (este repo pina 3.13)
+PINNED_VER=$(cat .python-version 2>/dev/null | tr -d '[:space:]' | cut -d. -f1-2)
+if [ "$PINNED_VER" != "3.13" ]; then
+  echo "ERRO: .python-version deve pinar 3.13 (encontrado: '$PINNED_VER')."
+  exit 1
+fi
+echo "Python pin: 3.13 OK"
+
+echo "[1/3] Syncing Dotcontext SSOT..."
+# Exporta .context/docs -> CLAUDE.md (edits no .context propagam para as IDEs de IA)
+npx @dotcontext/cli export-rules --preset claude --force
+if [ $? -ne 0 ]; then
+  echo "ERRO: dotcontext export-rules falhou!"
+  exit 1
+fi
+# Re-stage do CLAUDE.md caso o export-rules o tenha atualizado
+git add CLAUDE.md 2>/dev/null || true
+
+# Sincroniza agentes de .context/agents -> .claude/agents (preset claude).
+# NAO usar "--target .context": duplicava os playbooks na raiz do .context.
+npx @dotcontext/cli sync --preset claude
+if [ $? -ne 0 ]; then
+  echo "ERRO: dotcontext sync falhou!"
+  exit 1
+fi
+
+# Reverse-sync: importa edits feitos pelas IDEs de volta ao .context (autoritativo)
+npx @dotcontext/cli reverse-sync
+if [ $? -ne 0 ]; then
+  echo "ERRO: dotcontext reverse-sync falhou!"
+  exit 1
+fi
+
+echo "[2/3] Running Complete Audit (Lint, Security, Tests)..."
+uv run python .agent/scripts/checklist.py .
+if [ $? -ne 0 ]; then
+  echo "ERRO: Checklist falhou! Commit abortado para proteger a branch."
+  echo "Corrija os erros listados acima antes de commitar novamente."
+  exit 1
+fi
+
+echo "OK: All checks passed! Maestro Harness is clear. Commit allowed."
+exit 0

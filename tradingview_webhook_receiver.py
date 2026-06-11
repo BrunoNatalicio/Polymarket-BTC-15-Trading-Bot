@@ -107,16 +107,24 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0 or length > MAX_BODY_BYTES:
+            # Oversized/absent body: respond without draining; the connection
+            # is dropped after the response (HTTP/1.0 default), which is the
+            # safe behavior against huge payloads.
+            self._respond(413, "invalid body size")
+            return
+
+        # Drain the body BEFORE any response — answering with unread request
+        # data pending makes Windows abort the connection (WinError 10053)
+        # and the client sees a connection error instead of the status code.
+        body = self.rfile.read(length)
+
         if self.path.rstrip("/") != "/webhook":
             self._respond(404, "not found")
             return
 
-        length = int(self.headers.get("Content-Length", 0))
-        if length <= 0 or length > MAX_BODY_BYTES:
-            self._respond(413, "invalid body size")
-            return
-
-        payload, error = parse_alert(self.rfile.read(length))
+        payload, error = parse_alert(body)
         if error or payload is None:
             logger.warning(f"Webhook rejected: {error}")
             self._respond(400, error or "bad request")

@@ -17,6 +17,9 @@ dev = [
 [tool.ruff]
 line-length = 88
 target-version = "py313"
+# .agent/ é o kit vendorizado do Maestro Harness (copiado do repo indicador);
+# não segue o estilo deste projeto e pode ser regerado — fora do escopo do lint.
+extend-exclude = [".agent"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C90", "S", "T20"]
@@ -56,3 +59,4 @@ pythonVersion = "3.13"
 typeCheckingMode = "basic"
 reportMissingImports = false
 reportMissingModuleSource = false
+exclude = ["**/__pycache__", ".venv", ".agent"]
