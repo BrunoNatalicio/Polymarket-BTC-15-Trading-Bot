@@ -3,7 +3,7 @@ type: doc
 name: data-flow
 description: How data moves through the system and external integrations
 category: data-flow
-generated: 2026-06-11
+generated: 2026-06-12
 status: filled
 scaffoldVersion: "2.0.0"
 ---
@@ -85,10 +85,13 @@ data_sources/* (Binance, Coinbase, Solana, news/social, Deribit)
 **TradingView path (`active_strategy == "tradingview"`):**
 
 ```
-TradingView alert -> tunnel (cloudflared/ngrok)
-  -> tradingview_webhook_receiver.py (validates shared secret, builds signal message)
-  -> RPUSH btc_trading:tradingview_signals (Redis DB 2)
-  -> bot.py _start_webhook_consumer (BLPOP, separate thread)
+TradingView alert -> named Cloudflare tunnel (tvbot.<domain>, prod) or quick tunnel (testing)
+  -> tradingview_webhook_receiver.py
+       -> validate shared secret + signal (UP/DOWN); secret is stripped here, never forwarded
+       -> build_signal_message: {id, signal, received_at} + any extra alert fields (e.g. preco_fechamento, volume)
+  -> RPUSH btc_trading:tradingview_signals (Redis DB 2)   # bot's trade queue
+  -> RPUSH btc_trading:tv_signal_log       (Redis DB 2)   # best-effort tap for the backtest recorder
+  -> bot.py _start_webhook_consumer (BLPOP, separate thread; launched in on_start)
   -> _execute_webhook_trade
        -> discard if signal age > TRADINGVIEW_SIGNAL_TTL_SECONDS (30s)
        -> enforce max 1 trade per 15m market (btc_trading:tv_last_traded_market)
@@ -96,7 +99,15 @@ TradingView alert -> tunnel (cloudflared/ngrok)
        -> _place_real_order(dry_run=...) per btc_trading:tv_dry_run / btc_trading:simulation_mode
             - dry run: full live order path, submit_order skipped, appended to tv_dry_run_trades.json
             - sim/live: real order via execution/polymarket_client
+
+Data-collection tap (independent of the trade path, runs whenever the recorder is up):
+  btc_trading:tv_signal_log -> backtest recorder (python -m backtest record)
+    -> backtest/data/backtest.db, signals.raw_json   # extra fields (preco_fechamento, volume) land here; gate stays secret+signal
 ```
+
+The trade gate uses only `secret` + `signal`; extra alert fields are passed through purely for the recorder
+(`signals.raw_json`) and never influence the trade. The `secret` is excluded from the built message, so it is
+never written to Redis or disk.
 
 ## Internal Movement
 
@@ -121,7 +132,12 @@ TradingView alert -> tunnel (cloudflared/ngrok)
 - **News/social sentiment** (`data_sources/news_social/adapter.py`) - Fear & Greed index + social sentiment.
 - **Redis** (localhost:6379, DB 2, hosted in WSL - see [[redis-runs-in-wsl]]) - control-plane keys and the
   TradingView signal queue.
-- **TradingView** - webhook alerts via a public tunnel to `tradingview_webhook_receiver.py` (port 8001).
+- **TradingView** - webhook alerts via a public **named Cloudflare tunnel** (`tvbot.<domain>`, run as a Windows
+  service for a stable hostname) to `tradingview_webhook_receiver.py` (port 8001); setup in
+  [tradingview-runbook.md](tradingview-runbook.md) §3.
+- **Backtest recorder** (`python -m backtest record`) - drains `btc_trading:tv_signal_log` and records Polymarket
+  orderbooks into `backtest/data/backtest.db`; the data-collection tap above lands enriched signals in
+  `signals.raw_json`.
 - **Grafana** (`grafana/import_dashboard.py`, `grafana/dashboard.json`) - dashboard provisioning, scrapes the
   Prometheus exporter.
 

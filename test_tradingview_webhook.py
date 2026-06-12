@@ -121,6 +121,56 @@ def test_direction_mapping():
     check("DOWN -> short", map_direction("DOWN") == "short")
 
 
+def test_extra_fields():
+    print("\n7. extra fields (data collection passthrough)")
+
+    # parse_alert captures non-canonical fields under "extra"
+    payload, err = parse_alert(
+        b'{"secret":"abc","signal":"UP","preco_fechamento":"63500.1","volume":"170"}'
+    )
+    check(
+        "extra fields captured",
+        err is None
+        and payload is not None
+        and payload["extra"] == {"preco_fechamento": "63500.1", "volume": "170"},
+    )
+
+    # the secret must NEVER be carried into extra (it would be persisted to disk)
+    check(
+        "secret excluded from extra",
+        payload is not None and "secret" not in payload["extra"],
+    )
+
+    # no extra fields -> empty dict
+    payload, err = parse_alert(b'{"secret":"abc","signal":"DOWN"}')
+    check("no extras -> empty dict", payload is not None and payload["extra"] == {})
+
+    # build_signal_message merges extra alongside canonical keys
+    msg = json.loads(build_signal_message("UP", extra={"preco_fechamento": "63500.1"}))
+    check(
+        "message carries extra field",
+        msg.get("preco_fechamento") == "63500.1"
+        and msg["signal"] == "UP"
+        and bool(msg["id"])
+        and "received_at" in msg,
+    )
+
+    # canonical keys cannot be overridden by attacker-supplied extra
+    msg = json.loads(
+        build_signal_message(
+            "UP", extra={"signal": "DOWN", "id": "x", "received_at": 0}
+        )
+    )
+    check(
+        "extra cannot override canonical keys",
+        msg["signal"] == "UP" and msg["id"] != "x" and msg["received_at"] != 0,
+    )
+
+    # secret never appears in the built message
+    msg = json.loads(build_signal_message("UP", extra={"foo": "bar"}))
+    check("no secret in built message", "secret" not in msg)
+
+
 def test_redis_roundtrip():
     print("\n5. Redis round-trip")
     client = get_redis_client()
@@ -228,6 +278,20 @@ def test_http_end_to_end():
         req = urllib.request.Request(f"http://127.0.0.1:{port}/health")
         with urllib.request.urlopen(req, timeout=5) as resp:
             check("health check -> 200", resp.status == 200)
+
+        # Rich alert: extra fields must flow into the queued message (for the
+        # backtest recorder) while the secret is stripped out.
+        status = post(
+            "/webhook",
+            b'{"secret": "test-secret", "signal": "DOWN", "preco_fechamento": "63500.1"}',
+        )
+        check("rich alert -> 200", status == 200)
+        rich = json.loads(stub.queues[SIGNALS_KEY][-1])
+        check(
+            "extra field flows to queue",
+            rich.get("preco_fechamento") == "63500.1" and rich["signal"] == "DOWN",
+        )
+        check("secret stripped from queued message", "secret" not in rich)
     finally:
         server.shutdown()
         server.server_close()
@@ -242,6 +306,7 @@ def main() -> int:
     test_validate_secret()
     test_staleness()
     test_direction_mapping()
+    test_extra_fields()
     test_redis_roundtrip()
     test_http_end_to_end()
 

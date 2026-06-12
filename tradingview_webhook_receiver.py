@@ -60,7 +60,14 @@ def parse_alert(raw_body: bytes) -> tuple[dict[str, Any] | None, str | None]:
     signal = str(data.get("signal", "")).strip().upper()
     if signal not in VALID_SIGNALS:
         return None, f"invalid signal: {signal!r}"
-    return {"signal": signal, "secret": str(data.get("secret", ""))}, None
+    # Carry any other fields (e.g. preco_fechamento, volume) through for the
+    # backtest recorder. The secret is deliberately excluded so it is never
+    # persisted to disk; signal is canonical and rebuilt downstream.
+    extra = {k: v for k, v in data.items() if k not in ("secret", "signal")}
+    return (
+        {"signal": signal, "secret": str(data.get("secret", "")), "extra": extra},
+        None,
+    )
 
 
 def validate_secret(provided: str, expected: str) -> bool:
@@ -68,15 +75,22 @@ def validate_secret(provided: str, expected: str) -> bool:
     return bool(expected) and hmac.compare_digest(provided, expected)
 
 
-def build_signal_message(signal: str, received_at: float | None = None) -> str:
-    """Build the JSON message pushed to the Redis queue."""
-    return json.dumps(
-        {
-            "id": uuid.uuid4().hex[:12],
-            "signal": signal,
-            "received_at": received_at if received_at is not None else time.time(),
-        }
-    )
+def build_signal_message(
+    signal: str,
+    received_at: float | None = None,
+    extra: dict[str, Any] | None = None,
+) -> str:
+    """Build the JSON message pushed to the Redis queue.
+
+    ``extra`` fields (carried from the alert body for the backtest recorder)
+    are merged in first; the canonical id/signal/received_at are written last
+    so they can never be overridden by caller-supplied data.
+    """
+    message: dict[str, Any] = dict(extra) if extra else {}
+    message["id"] = uuid.uuid4().hex[:12]
+    message["signal"] = signal
+    message["received_at"] = received_at if received_at is not None else time.time()
+    return json.dumps(message)
 
 
 def get_redis_client() -> redis.Redis | None:
@@ -140,7 +154,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._respond(403, "forbidden")
             return
 
-        message = build_signal_message(payload["signal"])
+        message = build_signal_message(payload["signal"], extra=payload["extra"])
         try:
             self.redis_client.rpush(SIGNALS_KEY, message)
             self.redis_client.ltrim(SIGNALS_KEY, -MAX_QUEUE_LEN, -1)

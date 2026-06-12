@@ -1,9 +1,9 @@
 ---
 type: doc
 name: tradingview-runbook
-description: Operator runbook for the TradingView webhook strategy - setup, dry-run validation, go-live, and troubleshooting
+description: Operator runbook for the TradingView webhook strategy - named-tunnel setup, dry-run validation, enriched data collection, go-live, and troubleshooting
 category: runbook
-generated: 2026-06-11
+generated: 2026-06-12
 status: filled
 scaffoldVersion: "2.0.0"
 ---
@@ -32,13 +32,18 @@ applies risk limits, and executes. For the architecture behind this, see [archit
 
 ## 2. Process Topology
 
-Three long-running processes, started independently:
+Two application processes plus the public tunnel:
 
 | Process | Command | Restarts? |
 | --- | --- | --- |
 | Webhook receiver | `uv run python tradingview_webhook_receiver.py` | No — must stay up so the tunnel target is stable |
-| Tunnel | `cloudflared tunnel --url http://localhost:8001` (or `ngrok http 8001`) | No — restart changes quick-tunnel URLs |
+| Tunnel (production) | Named Cloudflare tunnel `tvbot` → `tvbot.<your-domain>`, run as a Windows **service** (setup in §3) | Auto — Windows service; survives reboot, logout, and bot restarts |
+| Tunnel (testing only) | `cloudflared tunnel --url http://localhost:8001` (or `ngrok http 8001`) | No — restart changes the throwaway `trycloudflare.com` URL |
 | Bot | `uv run python 15m_bot_runner.py --test-mode` (or `--live`) | Yes — supervisor restarts `bot.py` every ~90 min |
+
+Production uses the **named tunnel** because it gives a stable hostname and runs as a service independent of any
+terminal — it does not need re-launching after a reboot or after the bot's 90-minute restarts. The quick tunnel
+is for throwaway local testing only (its URL changes on every restart).
 
 The receiver ([tradingview_webhook_receiver.py](../../tradingview_webhook_receiver.py)) is deliberately a
 separate process from the bot: `15m_bot_runner.py` restarts `bot.py` periodically, and the tunnel must keep a
@@ -63,10 +68,49 @@ The receiver binds `127.0.0.1` only — nothing but the local tunnel can reach i
    it is the only thing authenticating TradingView to your bot.
 2. **Start the receiver**: `uv run python tradingview_webhook_receiver.py`. Confirm the log line
    `listening on http://127.0.0.1:8001/webhook`.
-3. **Start the tunnel**: `cloudflared tunnel --url http://localhost:8001`. Note the public URL it prints
-   (e.g. `https://<random>.trycloudflare.com`).
-   - Quick tunnels get a **new URL on every restart** — fine for testing, painful for production. For a stable
-     hostname use a named Cloudflare tunnel or a paid ngrok domain.
+3. **Start the tunnel.** Production uses a **named Cloudflare tunnel** (stable hostname, runs as a Windows
+   service). A quick tunnel is acceptable only for throwaway testing.
+
+   **Production — named tunnel (one-time setup).** Prerequisite: a domain **already added to your Cloudflare
+   account** (the tunnel's DNS record is created in that zone). The three commands below write two files into
+   `%USERPROFILE%\.cloudflared\` that later steps depend on: `login` writes `cert.pem`, `create` writes the
+   `<uuid>.json` credentials.
+   ```bash
+   cloudflared tunnel login                                  # browser auth; writes cert.pem
+   cloudflared tunnel create tvbot                           # creates the tunnel + a <uuid>.json credentials file
+   cloudflared tunnel route dns tvbot tvbot.<your-domain>    # DNS CNAME -> the tunnel
+   ```
+   Write `%USERPROFILE%\.cloudflared\config.yml`:
+   ```yaml
+   tunnel: <tunnel-uuid>
+   credentials-file: C:\Users\<you>\.cloudflared\<tunnel-uuid>.json
+   ingress:
+     - hostname: tvbot.<your-domain>
+       service: http://localhost:8001
+     - service: http_status:404
+   ```
+   Then install it as a service and apply the **two Windows gotchas** (both need an elevated/admin shell):
+   - The service runs as **LocalSystem**, which looks for `config.yml` in
+     `C:\Windows\System32\config\systemprofile\.cloudflared\`, **not** your user profile. Copy `config.yml`,
+     `cert.pem`, and the `<uuid>.json` credentials there.
+   - `cloudflared service install` registers the service with **no run arguments**, so it starts and exits
+     immediately (symptom: service shows *failed to start*, or RUNNING with **0 connections**). Point its
+     ImagePath at the real `tunnel run`:
+     ```powershell
+     Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\cloudflared' -Name ImagePath `
+       -Value '"C:\Users\<you>\AppData\Local\Microsoft\WinGet\Packages\Cloudflare.cloudflared_*\cloudflared.exe" --config "C:\Windows\System32\config\systemprofile\.cloudflared\config.yml" tunnel run' `
+       -Type ExpandString
+     Start-Service cloudflared
+     ```
+     (`Cloudflare.cloudflared_*` is a **placeholder** — the registry does not expand `*`; substitute the real
+     versioned folder, e.g. `Cloudflare.cloudflared_Microsoft.Winget.Source_8wekyb3d8bbwe`.)
+   Healthy = `cloudflared tunnel info tvbot` lists an **active connector with edge connections**, and the
+   service log shows `Registered tunnel connection`. (A `Failed to initialize DNS local resolver` line is
+   benign and can be ignored.) The hostname is now permanent — TradingView alerts never need their URL updated
+   again.
+
+   **Testing only — quick tunnel:** `cloudflared tunnel --url http://localhost:8001` prints a new
+   `https://<random>.trycloudflare.com` on every restart.
 4. **Sanity-check both hops**: `curl http://localhost:8001/health` → body `ok` (receiver itself), then
    `curl https://<tunnel-host>/health` → body `ok` (tunnel + receiver). If the first works and the second
    doesn't, the problem is the tunnel, not the receiver.
@@ -81,6 +125,18 @@ The receiver binds `127.0.0.1` only — nothing but the local tunnel can reach i
      {"secret": "YOUR_SECRET", "signal": "DOWN"}
      ```
    - `signal` is case-insensitive and whitespace-tolerant; anything other than UP/DOWN is rejected with 400.
+   - **Optional — richer data for the backtest recorder.** Any extra fields you add to the message are carried
+     through to `backtest.db` (`signals.raw_json`) by the recorder, while the **trade gate stays `secret` +
+     `signal` only** (the bot ignores the extras). This capture only happens when the **recorder is running**
+     (`uv run python -m backtest record`): the receiver copies every accepted signal to a separate Redis list
+     `btc_trading:tv_signal_log` that only the recorder drains (the bot's trade queue
+     `btc_trading:tradingview_signals` is never touched by it). Capturing the BTC close at signal time is valuable: the 15m
+     market is binary on the BTC price, so the close lets the replay relate the signal to the strike and the
+     token's implied probability. **Quote numeric placeholders** so an empty value can never break the JSON:
+     ```json
+     {"secret": "YOUR_SECRET", "signal": "UP", "preco_fechamento": "{{close}}", "volume": "{{volume}}"}
+     ```
+     The `secret` is **never** persisted — `parse_alert` strips it before the signal message is built (§8).
    - How your indicator emits UP vs DOWN is indicator-specific: typically you create one alert on the "buy"
      condition and one on the "sell" condition of the same indicator. The bot doesn't care which condition
      fired — only the `signal` field in the message.
@@ -142,7 +198,8 @@ Run through in order; each step has a verification.
    Redis does not need to be up — the Redis round-trip section skips gracefully — but with Redis up all
    sections run.
 2. Receiver up → `curl https://<tunnel-host>/health` returns the body `ok` with HTTP 200.
-3. TradingView alerts configured with the **current** tunnel URL (quick-tunnel URLs change on restart).
+3. TradingView alerts point at the **named** tunnel URL (`https://tvbot.<your-domain>/webhook`) — stable, no
+   update needed across restarts. (Only a quick tunnel, used for testing, changes its URL on restart.)
 4. `uv run python redis_control.py status` → shows `Strategy: TRADINGVIEW WEBHOOK` **and** `TV Dry Run: ON`
    (dry run must still be ON at this step; it is turned off only at step 8).
 5. Dry-run period completed (§4) and `tv_dry_run_trades.json` reviewed — entries fire when your indicator
@@ -176,8 +233,9 @@ each arriving signal but logs `IGNORED — fusion strategy active` instead of tr
   wsl redis-cli -n 2 GET btc_trading:tv_last_traded_market         # last traded market id
   ```
 - **Receiver restart** corrupts nothing (all state lives in Redis), but alerts that fire while it's down are
-  lost — TradingView does not reliably retry. **Tunnel restart** changes quick-tunnel URLs — update the
-  TradingView alerts.
+  lost — TradingView does not reliably retry. The **named tunnel** is a Windows service with a stable hostname,
+  so its URL never changes; only a **quick tunnel** (testing) gets a new URL on restart, which then requires
+  updating the TradingView alerts.
 - The bot enforces **max 1 trade per 15-minute market**. The dedup key only needs to outlive the current
   15-minute market; its 1-hour expiry is just housekeeping. The point of keeping it in Redis (instead of bot
   memory) is that a bot restart *mid-market* can't cause a second trade in the same market. Extra alerts in
@@ -192,6 +250,8 @@ each arriving signal but logs `IGNORED — fusion strategy active` instead of tr
 | Alert returns `403 forbidden` | Secret in alert JSON ≠ `.env` secret | Fix the alert message; never log/echo the secret |
 | Alert returns `400 invalid JSON` / `invalid signal` | Alert message isn't the exact JSON, or signal ≠ UP/DOWN | Copy the JSON template from §3 verbatim |
 | Alert returns 200 but bot does nothing | Bot not running, or strategy ≠ `tradingview` | `redis_control.py status`; start bot; `strategy tradingview` |
+| Alert returns 200, `LLEN btc_trading:tradingview_signals` stays > 0, no trade | Webhook consumer never started — bot booted "skewed" (`redis_client` came up None, or stuck in `_load_all_btc_instruments`). The consumer launches inside `on_start`, only after the live node reaches RUNNING + a 10s post-reconciliation delay | Restart `bot.py`; a healthy boot logs `TradingView webhook consumer started (BLPOP...)` and the queue drains within seconds |
+| Bot log at startup: `PolyApiException[status_code=401 ... Unauthorized/Invalid api key]` | Polymarket API credentials in `.env` are invalid/expired | **Dry run is unaffected** (`submit_order` is skipped); regenerate `POLYMARKET_API_KEY`/`SECRET`/`PASSPHRASE` **before going live**, or real orders fail with 401 |
 | Bot log: `IGNORED — fusion strategy active` | `btc_trading:active_strategy` is `fusion` | `uv run python redis_control.py strategy tradingview` |
 | Bot log: `DISCARDED — stale` | Signal sat in the queue > TTL (bot was down, or tunnel latency) | Expected protection; check why the bot was slow/down |
 | Bot log: `IGNORED — already traded market` | Second alert in same 15-min market | Expected (dedup); at most 1 trade per market |
@@ -199,6 +259,8 @@ each arriving signal but logs `IGNORED — fusion strategy active` instead of tr
 | Bot log: `Risk engine blocked TradingView trade` | Position-count/exposure/daily-loss limit hit | Review open positions; limits live in [execution/risk_engine.py](../../execution/risk_engine.py) |
 | Bot log: `No liquidity for BUY/SELL` | Orderbook essentially empty (bid/ask ≤ $0.02) | Expected guard; no action |
 | TradingView shows webhook errors | Tunnel down or URL stale | `curl http://localhost:8001/health` first: if it returns `ok`, the receiver is fine and the tunnel is the problem — restart tunnel, update alert URL |
+| Public `/health` returns Cloudflare `error 1033` | Named tunnel has **no active connector** (the LocalSystem service isn't serving it) | `cloudflared tunnel info tvbot`; ensure the config lives in the systemprofile `.cloudflared` and the service ImagePath runs `tunnel run` (§3) |
+| Public `/health` returns `502` | Tunnel is up but **nothing is listening on 8001** | Start the receiver; the 502 clears the instant it binds (confirms the tunnel→origin path is intact) |
 | Dry-run trades missing from `tv_dry_run_trades.json` | Dry run not enabled, or trade was blocked earlier (see rows above) | `redis_control.py status`; search bot log for the signal |
 
 ## 8. Invariants — Do Not Break
@@ -214,6 +276,12 @@ and [security.md](security.md)):
 - **Per-market dedup**: at most one TradingView trade per 15-minute market
   (`btc_trading:tv_last_traded_market`, Redis-backed so it survives bot restarts).
 - **$1 position cap**: enforced by `RiskEngine` for every path — fusion, webhook, sim, live, dry run.
+- **Secret is never persisted**: `parse_alert` excludes `secret` from the fields carried into the signal
+  message. It must never reach Redis, `tv_dry_run_trades.json`, or `backtest.db` (`signals.raw_json`). Extra
+  alert fields may be collected; the secret may not.
+- **Trade gate is `secret` + `signal` only**: extra alert fields are passed through for data collection but
+  must never influence the trade decision; `build_signal_message` writes the canonical `id`/`signal`/
+  `received_at` last so caller-supplied extras cannot override them.
 - **Receiver stays a separate process**: never fold it into `bot.py`.
 
 ## Related Resources
