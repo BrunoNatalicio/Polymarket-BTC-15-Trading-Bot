@@ -11,7 +11,8 @@ scaffoldVersion: "2.0.0"
 ## Backtest Validation & Reporting — Signals vs Bot via the CLOB
 
 How we measure whether the strategy actually wins: resolve every market against the
-**Polymarket CLOB orderbook we recorded**, then report hit-rate + PnL two ways — the **strategy**
+**Polymarket CLOB (Central Limit Order Book) orderbook we recorded**, then report hit-rate + PnL
+two ways — the **strategy**
 (the signal, mapped to the window it intends to bet) and the **bot** (what it actually traded).
 This is the "source of truth" behind the manual validation in
 [tradingview-runbook.md](tradingview-runbook.md) §4. For data collection itself see
@@ -44,18 +45,23 @@ stamps the winner in `markets.outcome` with `markets.outcome_source`:
 | `gamma` | `gamma.get_resolved_outcome()` — `outcomePrices` on a market flagged `closed` | Fallback (rare for these de-indexed markets) |
 | `candle` | `_candle_outcome()` — Coinbase BTC-USD candle, `close ≥ open ⇒ YES` | Last resort; **approximation only** |
 
-`clob_outcome` returns `None` (not a guess) when books are missing or not yet decisive (e.g. a
-pre-expiry 0.60/0.40 book), so the caller falls through cleanly. Prices are stored as integer
-thousandths (`best_bid_m`, 0–1000) — exact, no float drift.
+The two price numbers play different roles: **~$0.99 / ~$0.01** is what a *resolved* market's book
+actually shows, while **0.90 / 0.10** are the deliberately tolerant *decision thresholds* — loose
+enough that a snapshot taken a few seconds before the final tick still resolves, strict enough to
+reject a still-live book. `clob_outcome` returns `None` (not a guess) when books are missing or not
+yet decisive (e.g. a pre-expiry 0.60/0.40 book), so the caller falls through cleanly. Prices are
+stored as integer thousandths (`best_bid_m`, 0–1000) — exact, no float drift.
 
 ## 3. Running it
 
 ```bash
-# 1. Resolve outcomes for all expired markets (CLOB-first). Run this first; it
-#    populates markets.outcome so the report can grade signals.
+# 1. (Optional) Resolve outcomes for all expired markets, CLOB-first, into
+#    markets.outcome. `report` already runs this internally — use `settle` on
+#    its own only to populate/inspect outcomes without a full report.
 uv run python -m backtest settle
 
-# 2. The report: strategy vs bot, hit-rate + PnL, resolved via the CLOB.
+# 2. The report (self-contained: runs settle internally): strategy vs bot,
+#    hit-rate + PnL, resolved via the CLOB.
 uv run python -m backtest report                       # defaults: live stream, 15m, $1 stake
 uv run python -m backtest report --start 2026-06-12 --end 2026-06-13
 uv run python -m backtest report --series 5m --signal-source tradingview_csv_300s
@@ -74,24 +80,29 @@ Período : 2026-06-12 00:00 -> 2026-06-13 10:25 UTC | série 15m | fonte=trading
   Resolvidos       : 10 -> 7 WIN / 3 LOSS (70%)   # graded against the CLOB
     UP  : 7 sinais | 4 WIN | 57%
     DOWN: 3 sinais | 3 WIN | 100%
-  PnL              : $+4.14 sobre $10.00 | slip 7 bps   # simulated fill on the real ask book
+  PnL              : $+4.14 sobre $10.00 | slip 7 bps   # fill simulado no ask real; slip = slippage em basis points
 [BOT] trades realmente executados
   Convertidos      : 9 de 10 sinais (dropados: 1)        # signals received vs trades executed
-  Resolvidos       : 8 -> 6 WIN / 2 LOSS (75%)  (sem CLOB: 1)
+  Resolvidos       : 8 -> 6 WIN / 2 LOSS (75%)  (sem CLOB: 1)   # sem CLOB = sem book gravado decisivo p/ resolver
   PnL              : $+4.10 sobre $8.00
 [GAP] sinais recebidos que o bot NÃO negociou:
-    2026-06-13 03:30:03 UTC  DOWN                         # the dropped DOWN (§5)
+    2026-06-13 03:30:03 UTC  DOWN                         # o DOWN dropado: 03:30 UTC = 00:30 local (§5)
 ```
+
+The report prints timestamps in **UTC**; §5 below narrates in **local time (UTC-3)** — the same
+dropped DOWN is `03:30 UTC` in the output and `00:30` in the findings.
 
 ## 4. The two views (and why they differ)
 
 The same signal can read as WIN in one view and LOSS in the other — that gap is the point.
 
-- **[ESTRATÉGIA]** — `engine.run_replay`. Each signal is mapped to the **next** 15-minute window
-  (`ingest.attach_target_tokens`: `floor(ts/900)*900`, the window that *opens* at the bar close —
-  the strategy's stated intent, same as `csv_hitrate.py`). It simulates a market-buy on the
-  recorded ask book (real slippage, no look-ahead: `merge_asof` direction=forward) and settles
-  against `markets.outcome`. This grades the **signal**, independent of bot bugs.
+- **[ESTRATÉGIA]** — `engine.run_replay`. Each signal is mapped to the window it intends to bet:
+  the **next** 15-minute window, "N+1". The mapping is `ingest.attach_target_tokens`'
+  `floor(ts/900)*900`; this lands on N+1 (not the window that just closed) because the signal's
+  timestamp *is* the bar close, which is also the next window's start. Same intent as
+  `csv_hitrate.py`. It then simulates a market-buy on the recorded ask book (real slippage, no
+  look-ahead — `merge_asof` matches the first snapshot at or after the signal) and settles against
+  `markets.outcome`. This grades the **signal**, independent of bot bugs.
 - **[BOT]** — `bot_trades.evaluate_bot_trades`. Reads `tv_dry_run_trades.json` (the market the bot
   **actually** bought + the entry price it paid) and resolves that market via `clob_outcome`.
   `conversion_stats` matches received signals (DB) to executed trades by timestamp (±5s) and lists
@@ -111,7 +122,7 @@ The report surfaces these automatically; recorded here so they aren't rediscover
   systematic — a race in `current_instrument_index` at the boundary.
 - **DOWN signals get dropped.** The 00:30 DOWN was received and logged by the recorder but produced
   **no trade** — the bot bailed before recording (most likely `_no_instrument_id is None` →
-  *"cannot bet DOWN. Skipping trade"* at [bot.py](../../bot.py):1491). Confronted with the CLOB it
+  *"cannot bet DOWN. Skipping trade"* in [bot.py](../../bot.py), around line 1491). Confronted with the CLOB it
   would have **won** (the N+1 window resolved NO). A winning signal lost to a bug, not a bad call.
 - **Candle ≠ CLOB.** For the 00:30 window the CLOB resolved **NO** but the Coinbase candle said
   **YES** — the first disagreement. Polymarket settles on Chainlink BTC/USD, not Coinbase; near a
@@ -140,7 +151,7 @@ data exposes — clear them before turning dry run off (also see
 | Bot-trade evaluation + conversion gap | `load_bot_trades`, `evaluate_bot_trades`, `conversion_stats` — [backtest/bot_trades.py](../../backtest/bot_trades.py) |
 | Strategy replay (fills, settle) | `run_replay`, `ReplayReport.summary` — [backtest/engine.py](../../backtest/engine.py) |
 | Signal→N+1 window mapping | `attach_target_tokens` — [backtest/ingest.py](../../backtest/ingest.py) |
-| CLI (`settle`, `report`, `replay`) | [backtest/\_\_main\_\_.py](../../backtest/__main__.py) |
+| CLI (`settle`, `report`, `replay`) | [`backtest/__main__.py`](../../backtest/__main__.py) |
 | Tests (offline, in-memory SQLite) | `test_clob_outcome`, `test_bot_trades` — [backtest/test_backtest.py](../../backtest/test_backtest.py) |
 
 Relevant schema ([backtest/db.py](../../backtest/db.py)): `markets(outcome, outcome_source,
