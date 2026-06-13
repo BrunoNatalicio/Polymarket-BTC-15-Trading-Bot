@@ -251,17 +251,142 @@ def test_csv_import():
         ).fetchall()
         check(
             "UP at bar close (open+900)",
-            rows[0] == ("csv-900000900-UP", 900000900.0, "UP"),
+            rows[0] == ("csv900s-900000900-UP", 900000900.0, "UP"),
         )
         check(
             "DOWN at bar close",
-            rows[1] == ("csv-900002700-DOWN", 900002700.0, "DOWN"),
+            rows[1] == ("csv900s-900002700-DOWN", 900002700.0, "DOWN"),
         )
         n2 = import_tradingview_csv(con, path, up_col="upX", down_col="downX")
         check("re-import is idempotent", n2 == 0)
         con.close()
     finally:
         os.unlink(path)
+
+
+def test_clob_outcome():
+    print("\n7. CLOB outcome resolution (recorded orderbook)")
+    import backtest.db as db
+    from backtest.settlement import clob_outcome
+
+    con = db.connect(":memory:")
+
+    def expired_book(slug, ws, winner):
+        we = ws + 900
+        db.upsert_market(con, slug, "Y", "N", ws, we)
+        yes_win = winner == "YES"
+        # Winning side: bid ~0.99 / no ask; losing side: ask ~0.01 / no bid.
+        db.insert_snapshot(
+            con,
+            ts=we - 1,
+            market_slug=slug,
+            token_id="Y",
+            side_label="YES",
+            bids=[(0.99, 100.0)] if yes_win else [],
+            asks=[] if yes_win else [(0.01, 100.0)],
+        )
+        db.insert_snapshot(
+            con,
+            ts=we - 1,
+            market_slug=slug,
+            token_id="N",
+            side_label="NO",
+            bids=[] if yes_win else [(0.99, 100.0)],
+            asks=[(0.01, 100.0)] if yes_win else [],
+        )
+        return we
+
+    we1 = expired_book("btc-updown-15m-1000000", 1000000, "YES")
+    check(
+        "YES winner detected", clob_outcome(con, "btc-updown-15m-1000000", we1) == "YES"
+    )
+
+    we2 = expired_book("btc-updown-15m-2000000", 2000000, "NO")
+    check(
+        "NO winner detected", clob_outcome(con, "btc-updown-15m-2000000", we2) == "NO"
+    )
+
+    # Ambiguous book (0.60/0.40) before resolution -> None (fall back to gamma/candle)
+    slug3, ws3 = "btc-updown-15m-3000000", 3000000
+    db.upsert_market(con, slug3, "Y", "N", ws3, ws3 + 900)
+    db.insert_snapshot(
+        con,
+        ts=ws3 + 899,
+        market_slug=slug3,
+        token_id="Y",
+        side_label="YES",
+        bids=[(0.60, 100.0)],
+        asks=[(0.62, 100.0)],
+    )
+    db.insert_snapshot(
+        con,
+        ts=ws3 + 899,
+        market_slug=slug3,
+        token_id="N",
+        side_label="NO",
+        bids=[(0.38, 100.0)],
+        asks=[(0.40, 100.0)],
+    )
+    check("ambiguous 0.60/0.40 -> None", clob_outcome(con, slug3, ws3 + 900) is None)
+    check(
+        "missing books -> None",
+        clob_outcome(con, "btc-updown-15m-9999999", 9999999) is None,
+    )
+    con.close()
+
+
+def test_bot_trades():
+    print("\n8. bot trade evaluation vs CLOB")
+    import backtest.db as db
+    from backtest.bot_trades import evaluate_bot_trades
+
+    con = db.connect(":memory:")
+    wa, wb = 4000000, 5000000
+    sa, sb = f"btc-updown-15m-{wa}", f"btc-updown-15m-{wb}"
+    # Market A resolves NO; market B resolves YES.
+    for slug, ws, yes_win in ((sa, wa, False), (sb, wb, True)):
+        db.upsert_market(con, slug, "Y", "N", ws, ws + 900)
+        db.insert_snapshot(
+            con,
+            ts=ws + 899,
+            market_slug=slug,
+            token_id="Y",
+            side_label="YES",
+            bids=[(0.99, 100.0)] if yes_win else [],
+            asks=[] if yes_win else [(0.01, 100.0)],
+        )
+        db.insert_snapshot(
+            con,
+            ts=ws + 899,
+            market_slug=slug,
+            token_id="N",
+            side_label="NO",
+            bids=[] if yes_win else [(0.99, 100.0)],
+            asks=[(0.01, 100.0)] if yes_win else [],
+        )
+
+    trades = [
+        # UP on market A (NO wins) -> LOSS: stake $1 -> pnl -1
+        {
+            "trade_label": "YES (UP)",
+            "price": 0.50,
+            "usd_amount": 1.0,
+            "market_slug": sa,
+        },
+        # UP on market B (YES wins) -> WIN: $1 at 0.50 = 2 tokens, payout 2, pnl +1
+        {
+            "trade_label": "YES (UP)",
+            "price": 0.50,
+            "usd_amount": 1.0,
+            "market_slug": sb,
+        },
+    ]
+    res = evaluate_bot_trades(con, trades)
+    check("1 win / 1 loss", res["wins"] == 1 and res["losses"] == 1)
+    check("win rate 50%", abs(res["win_rate"] - 0.5) < 1e-9)
+    check("pnl 0.0 (+1 -1)", abs(res["total_pnl"] - 0.0) < 1e-9)
+    check("staked $2", abs(res["total_staked"] - 2.0) < 1e-9)
+    con.close()
 
 
 def main() -> int:
@@ -275,6 +400,8 @@ def main() -> int:
     test_settlement()
     test_end_to_end_replay()
     test_csv_import()
+    test_clob_outcome()
+    test_bot_trades()
 
     print("\n" + "=" * 60)
     print(f"RESULT: {PASSED} passed, {FAILED} failed")

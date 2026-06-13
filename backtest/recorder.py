@@ -27,7 +27,11 @@ load_dotenv()
 
 CLOB_BASE = "https://clob.polymarket.com"
 HTTP_TIMEOUT = 5.0
-WINDOW_SECONDS = 900
+# Polymarket BTC up/down recurring series: slug prefix -> window length (s).
+SERIES = {
+    "15m": ("btc-updown-15m-", 900),
+    "5m": ("btc-updown-5m-", 300),
+}
 PREFETCH_LEAD_S = 60  # fetch next market's tokens this long before rollover
 EXPIRY_GRACE_S = 30  # keep polling an expired market this long past its end
 TV_SIGNAL_LOG_KEY = "btc_trading:tv_signal_log"
@@ -67,20 +71,23 @@ def normalize_levels(
     return parsed[:depth]
 
 
-def current_window_start(now: float | None = None) -> int:
+def current_window_start(window_seconds: int, now: float | None = None) -> int:
     ts = int(now if now is not None else time.time())
-    return ts - (ts % WINDOW_SECONDS)
-
-
-def slug_for_window(window_start: int) -> str:
-    return f"btc-updown-15m-{window_start}"
+    return ts - (ts % window_seconds)
 
 
 class Recorder:
-    def __init__(self, con: sqlite3.Connection, poll_seconds: float, depth: int):
+    def __init__(
+        self,
+        con: sqlite3.Connection,
+        poll_seconds: float,
+        depth: int,
+        series: list[str] | None = None,
+    ):
         self.con = con
         self.poll_seconds = poll_seconds
         self.depth = depth
+        self.series = [s for s in (series or list(SERIES)) if s in SERIES]
         # slug -> {yes_token_id, no_token_id, window_start, window_end}
         self.tracked: dict[str, dict[str, Any]] = {}
         self.redis_client: redis.Redis | None = None
@@ -88,10 +95,12 @@ class Recorder:
 
     # -- market tracking -----------------------------------------------------
 
-    def _track_market(self, window_start: int) -> None:
+    def _track_market(
+        self, prefix: str, window_start: int, window_seconds: int
+    ) -> None:
         import backtest.gamma as gamma  # late import keeps module load light
 
-        slug = slug_for_window(window_start)
+        slug = f"{prefix}{window_start}"
         if slug in self.tracked:
             return
         tokens = gamma.get_market_tokens(slug)
@@ -101,7 +110,7 @@ class Recorder:
             "yes_token_id": tokens["yes_token_id"],
             "no_token_id": tokens["no_token_id"],
             "window_start": window_start,
-            "window_end": window_start + WINDOW_SECONDS,
+            "window_end": window_start + window_seconds,
         }
         self.tracked[slug] = info
         db.upsert_market(
@@ -116,10 +125,13 @@ class Recorder:
         logger.info(f"Tracking market {slug}")
 
     def refresh_tracked_markets(self, now: float) -> None:
-        start = current_window_start(now)
-        self._track_market(start)
-        if now >= start + WINDOW_SECONDS - PREFETCH_LEAD_S:
-            self._track_market(start + WINDOW_SECONDS)
+        for name in self.series:
+            prefix, win_s = SERIES[name]
+            start = current_window_start(win_s, now)
+            self._track_market(prefix, start, win_s)
+            lead = min(PREFETCH_LEAD_S, win_s // 3)
+            if now >= start + win_s - lead:
+                self._track_market(prefix, start + win_s, win_s)
         expired = [
             slug
             for slug, info in self.tracked.items()
@@ -242,8 +254,13 @@ class Recorder:
 def main() -> int:
     poll_seconds = float(os.getenv("BACKTEST_POLL_SECONDS", "2.0"))
     depth = int(os.getenv("BACKTEST_BOOK_DEPTH", "20"))
+    series = [
+        s.strip()
+        for s in os.getenv("BACKTEST_SERIES", "15m,5m").split(",")
+        if s.strip()
+    ]
     con = db.connect()
-    recorder = Recorder(con, poll_seconds=poll_seconds, depth=depth)
+    recorder = Recorder(con, poll_seconds=poll_seconds, depth=depth, series=series)
     try:
         recorder.run_forever()
     except KeyboardInterrupt:

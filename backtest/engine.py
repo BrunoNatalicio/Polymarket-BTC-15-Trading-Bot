@@ -15,7 +15,10 @@ import backtest.ingest as ingest
 import backtest.matching as matching
 import backtest.settlement as settlement
 
-WINDOW_SECONDS = 900
+SERIES = {
+    "15m": ("btc-updown-15m-", 900),
+    "5m": ("btc-updown-5m-", 300),
+}
 
 
 @dataclass
@@ -73,13 +76,18 @@ def run_replay(
     tolerance_s: float = 10.0,
     fee_rate: float = 0.0,
     fill_policy: str = "partial",
+    series: str = "15m",
+    source_like: str | None = None,
 ) -> ReplayReport:
+    slug_prefix, window_seconds = SERIES[series]
     report = ReplayReport(start_ts=start_ts, end_ts=end_ts, stake_usd=stake_usd)
     markets = ingest.load_markets(con)
-    signals = ingest.load_signals(con, start_ts, end_ts)
+    signals = ingest.load_signals(con, start_ts, end_ts, source_like=source_like)
     if signals.empty:
         return report
-    signals = ingest.attach_target_tokens(signals, markets)
+    signals = ingest.attach_target_tokens(
+        signals, markets, window_seconds=window_seconds, slug_prefix=slug_prefix
+    )
 
     # One market window at a time keeps memory flat regardless of history.
     for _slug, group in signals.groupby("market_slug", sort=True):
@@ -93,7 +101,7 @@ def run_replay(
         token_ids = sorted({str(t) for t in sig_group["token_id"]})
         w_start = float(sig_group["window_start"].min())
         snaps = ingest.load_snapshot_meta(
-            con, token_ids, w_start, w_start + WINDOW_SECONDS + tolerance_s
+            con, token_ids, w_start, w_start + window_seconds + tolerance_s
         )
         aligned = ingest.align_signals_to_snapshots(sig_group, snaps, tolerance_s)
 

@@ -12,7 +12,7 @@ snapshot ids.
 
 import sqlite3
 from datetime import UTC, datetime
-from typing import cast
+from typing import Any, cast
 
 import pandas as pd
 
@@ -22,14 +22,26 @@ WINDOW_SECONDS = 900
 
 
 def load_signals(
-    con: sqlite3.Connection, start_ts: float, end_ts: float
+    con: sqlite3.Connection,
+    start_ts: float,
+    end_ts: float,
+    source_like: str | None = None,
 ) -> pd.DataFrame:
-    df = pd.read_sql_query(
-        "SELECT signal_id, ts, direction, source FROM signals "
-        "WHERE ts >= ? AND ts < ? ORDER BY ts",
-        con,
-        params=[start_ts, end_ts],
+    """Load signals in a time range, optionally filtered by source pattern.
+
+    Different signal streams (live webhook, 15m-chart CSV, 5m-chart CSV) are
+    distinct strategies — replay one stream at a time via `source_like`
+    (SQL LIKE pattern, e.g. 'tradingview_csv_300s' or 'tradingview').
+    """
+    query = (
+        "SELECT signal_id, ts, direction, source FROM signals WHERE ts >= ? AND ts < ?"
     )
+    params: list[Any] = [start_ts, end_ts]
+    if source_like:
+        query += " AND source LIKE ?"
+        params.append(source_like)
+    query += " ORDER BY ts"
+    df = pd.read_sql_query(query, con, params=params)
     df["direction"] = df["direction"].astype("category")
     return df
 
@@ -42,16 +54,22 @@ def load_markets(con: sqlite3.Connection) -> pd.DataFrame:
     )
 
 
-def attach_target_tokens(signals: pd.DataFrame, markets: pd.DataFrame) -> pd.DataFrame:
+def attach_target_tokens(
+    signals: pd.DataFrame,
+    markets: pd.DataFrame,
+    window_seconds: int = WINDOW_SECONDS,
+    slug_prefix: str = "btc-updown-15m-",
+) -> pd.DataFrame:
     """Map each signal to the market window it trades and the token it buys.
 
     UP buys the YES token, DOWN buys the NO token (same direction mapping as
     the live bot). Signals whose market was never recorded keep NaN token_id
-    and are reported as unfilled, never silently dropped.
+    and are reported as unfilled, never silently dropped. `window_seconds` +
+    `slug_prefix` select the Polymarket series (15m default, 5m supported).
     """
     out = signals.copy()
-    out["window_start"] = (out["ts"].astype("int64") // WINDOW_SECONDS) * WINDOW_SECONDS
-    out["market_slug"] = "btc-updown-15m-" + out["window_start"].astype(str)
+    out["window_start"] = (out["ts"].astype("int64") // window_seconds) * window_seconds
+    out["market_slug"] = slug_prefix + out["window_start"].astype(str)
     out = out.merge(
         markets[["market_slug", "yes_token_id", "no_token_id", "outcome"]],
         on="market_slug",
@@ -208,18 +226,22 @@ def import_tradingview_csv(
         )
 
     inserted = 0
+    # bar_seconds participates in id and source: the 15m-chart and 5m-chart
+    # exports are DIFFERENT signal streams of the same indicator and must
+    # never dedup against each other nor mix in a replay
+    source = f"tradingview_csv_{bar_seconds}s"
     for direction, col in (("UP", up_col), ("DOWN", down_col)):
         active = df[col].fillna(0).astype(float) > 0
         for open_ts in bar_open_ts[active]:
             close_ts = int(open_ts) + bar_seconds
-            signal_id = f"csv-{close_ts}-{direction}"
+            signal_id = f"csv{bar_seconds}s-{close_ts}-{direction}"
             iso = datetime.fromtimestamp(close_ts, tz=UTC).isoformat()
             if insert_signal(
                 con,
                 signal_id=signal_id,
                 ts=float(close_ts),
                 direction=direction,
-                source="tradingview_csv",
+                source=source,
                 raw_json=f'{{"bar_close": "{iso}"}}',
             ):
                 inserted += 1

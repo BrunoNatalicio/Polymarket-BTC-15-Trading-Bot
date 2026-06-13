@@ -186,9 +186,14 @@ Expected observable sequence:
 3. A record appended to `tv_dry_run_trades.json` (timestamp, direction, price, qty, order id, market slug).
 
 Let it run with real alerts for at least a day (ideally 20+ signals across different market conditions).
-Review `tv_dry_run_trades.json` against actual market outcomes to measure the indicator's hit rate — for a $1
-binary market, the hit rate must beat the average entry price (e.g. entries around $0.60 need >60% accuracy
-to be profitable). When satisfied, proceed to §5.
+To measure the hit rate, don't eyeball `tv_dry_run_trades.json` — run the validation tool, which resolves every
+market against the recorded Polymarket CLOB and reports strategy-vs-bot hit-rate + PnL:
+```bash
+uv run python -m backtest report --signal-source tradingview
+```
+See [backtest-validation.md](backtest-validation.md) for the outcome model and how to read the two views. For a
+$1 binary market the hit rate must beat the average entry price (e.g. entries around $0.60 need >60% accuracy to
+be profitable). When satisfied, proceed to §5.
 
 ## 5. Go-Live Checklist
 
