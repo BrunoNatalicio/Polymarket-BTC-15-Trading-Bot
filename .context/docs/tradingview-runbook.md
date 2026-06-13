@@ -216,8 +216,8 @@ Run through in order; each step has a verification.
    `DISCARDED — no active market`, and `IGNORED — already traded market` are normal protections; what should
    make you stop and investigate is `IGNORED — fusion strategy active` (wrong strategy key) or frequent
    `Risk engine blocked` lines.
-6. Funds: the risk engine allows up to 5 concurrent $1 positions ($10 max exposure) — keep at least ~$15 USDC
-   in the Polymarket wallet so trades never fail on balance.
+6. Funds: the risk engine allows up to 5 concurrent positions of `MARKET_BUY_USD` each (exposure cap = 5×, so
+   $15 at the current $3 bet) — keep at least that much USDC in the Polymarket wallet so trades never fail on balance.
 7. `uv run python redis_control.py live` → type `yes` at the prompt.
 8. `uv run python redis_control.py dryrun off` — **the very next alert can submit a real order within
    seconds.** The safe procedure: pause the TradingView alerts, confirm the queue is empty
@@ -284,7 +284,8 @@ and [security.md](security.md)):
 - **Signal TTL**: webhook signals older than `TRADINGVIEW_SIGNAL_TTL_SECONDS` (30s) must be discarded.
 - **Per-market dedup**: at most one TradingView trade per 15-minute market
   (`btc_trading:tv_last_traded_market`, Redis-backed so it survives bot restarts).
-- **$1 position cap**: enforced by `RiskEngine` for every path — fusion, webhook, sim, live, dry run.
+- **Position cap = `MARKET_BUY_USD`** (env, default $1; currently $3): enforced by `RiskEngine` for every
+  path — fusion, webhook, sim, live, dry run. The cap scales with the env var.
 - **Secret is never persisted**: `parse_alert` excludes `secret` from the fields carried into the signal
   message. It must never reach Redis, `tv_dry_run_trades.json`, or `backtest.db` (`signals.raw_json`). Extra
   alert fields may be collected; the secret may not.

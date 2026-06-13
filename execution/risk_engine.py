@@ -3,6 +3,7 @@ Risk Engine
 Manages position sizing, risk limits, and portfolio constraints
 """
 
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -70,13 +71,17 @@ class RiskEngine:
         Args:
             limits: Risk limits configuration
         """
-        # Default conservative limits with $1 max per trade
+        # Default limits SCALE with the configured bet size (MARKET_BUY_USD env,
+        # default $1) — the same single knob bot.py uses for POSITION_SIZE_USD, so
+        # the cap never blocks the configured bet and dry-run/live stay aligned.
+        # With MARKET_BUY_USD=3 -> $3 / $15 / $15 (proportional).
+        _bet = Decimal(os.getenv("MARKET_BUY_USD", "1.00"))
         self.limits = limits or RiskLimits(
-            max_position_size=Decimal("1.0"),  # $1 max per position
-            max_total_exposure=Decimal("10.0"),  # $10 total
+            max_position_size=_bet,  # exactly the bet size (was $1)
+            max_total_exposure=_bet * 5,  # up to 5 concurrent positions
             max_positions=5,
             max_drawdown_pct=0.15,  # 15% max drawdown
-            max_loss_per_day=Decimal("5.0"),  # $5 daily loss limit
+            max_loss_per_day=_bet * 5,  # ~5 full losses/day (was $5)
             max_leverage=1.0,
         )
 
@@ -179,15 +184,19 @@ class RiskEngine:
         # Calculate position size
         position_size = risk_amount * strength_multiplier
 
-        # ENFORCE $1 MAXIMUM
-        if position_size > Decimal("1.0"):
+        # ENFORCE the configured MAXIMUM (max_position_size, derived from
+        # MARKET_BUY_USD). Note: the live webhook/fusion paths use the fixed
+        # POSITION_SIZE_USD instead and never call this.
+        max_size = self.limits.max_position_size
+        if position_size > max_size:
             logger.info(
-                f"Capping position size from ${float(position_size):.2f} to $1.00"
+                f"Capping position size from ${float(position_size):.2f} "
+                f"to ${float(max_size):.2f}"
             )
-            position_size = Decimal("1.0")
+            position_size = max_size
 
-        # Ensure at least $1 (for simulation, in live you might want higher minimum)
-        position_size = max(position_size, Decimal("1.0"))
+        # Floor at the configured size (fixed-size strategy)
+        position_size = max(position_size, max_size)
 
         logger.info(
             f"Calculated position size: ${position_size:.2f} "

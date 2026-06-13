@@ -140,7 +140,7 @@ The receiver is deliberately a separate process — `15m_bot_runner.py` restarts
 | `bot.py` | Main strategy — NautilusTrader `Strategy` subclass, integrates all phases |
 | `15m_bot_runner.py` | Auto-restart wrapper that re-launches `bot.py` on exit |
 | `execution/execution_engine.py` | Order lifecycle management (pending → filled/cancelled) |
-| `execution/risk_engine.py` | Position sizing, max-$1 cap, stop-loss/take-profit enforcement |
+| `execution/risk_engine.py` | Position sizing, `MARKET_BUY_USD` position cap, stop-loss/take-profit enforcement |
 | `execution/polymarket_client.py` | Polymarket CLOB API wrapper |
 | `execution/nautilus_polymarket_integration.py` | Bridges NautilusTrader events to the execution engine |
 | `patch_gamma_markets.py` | Monkey-patch applied at startup — do not remove |

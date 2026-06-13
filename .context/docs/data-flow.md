@@ -47,7 +47,7 @@ ingestion, signal processors, and fusion entirely.
 
 - [`SignalFusionEngine` / `get_fusion_engine`](../../core/strategy_brain/fusion_engine/signal_fusion.py) - weighted
   voting across signal processors, produces `FusedSignal`
-- [`RiskEngine` / `get_risk_engine`](../../execution/risk_engine.py) - position sizing, $1 cap,
+- [`RiskEngine` / `get_risk_engine`](../../execution/risk_engine.py) - position sizing, `MARKET_BUY_USD` cap,
   stop-loss/take-profit checks
 - [`ExecutionEngine` / `get_execution_engine`](../../execution/execution_engine.py) - order lifecycle
   (pending -> filled/cancelled)
@@ -75,7 +75,7 @@ data_sources/* (Binance, Coinbase, Solana, news/social, Deribit)
   -> core/strategy_brain/signal_processors/* (each emits a TradingSignal)
   -> core/strategy_brain/fusion_engine/signal_fusion (weighted vote -> FusedSignal)
   -> if score >= 60 and confidence >= 0.6 (actionable):
-       -> execution/risk_engine (sizing, $1 cap, SL/TP)
+       -> execution/risk_engine (sizing, MARKET_BUY_USD cap, SL/TP)
        -> execution/nautilus_polymarket_integration -> execution/execution_engine
        -> execution/polymarket_client (sim or live, per btc_trading:simulation_mode)
   -> monitoring/performance_tracker (records outcome)

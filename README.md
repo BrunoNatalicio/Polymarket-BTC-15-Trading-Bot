@@ -124,7 +124,7 @@ REDIS_PORT=6379
 REDIS_DB=2
 
 # Trading Parameters
-MAX_POSITION_SIZE=1.0
+MARKET_BUY_USD=1   # bet size in USD (dry-run + live + risk caps); default 1
 STOP_LOSS_PCT=0.30
 TAKE_PROFIT_PCT=0.20
 SPIKE_THRESHOLD=0.15

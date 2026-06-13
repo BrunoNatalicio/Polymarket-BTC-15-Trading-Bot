@@ -50,7 +50,7 @@ against Polymarket's short-duration crypto markets, with full sim/live/dry-run c
 - `SignalFusionEngine` / `FusedSignal` / `get_fusion_engine` ([core/strategy_brain/fusion_engine/signal_fusion.py](../../core/strategy_brain/fusion_engine/signal_fusion.py)) -
   weighted-voting fusion engine
 - `RiskEngine` / `get_risk_engine` ([execution/risk_engine.py](../../execution/risk_engine.py)) - position sizing
-  and the $1 risk cap
+  and the `MARKET_BUY_USD` risk cap (default $1)
 - `ExecutionEngine` / `get_execution_engine` ([execution/execution_engine.py](../../execution/execution_engine.py)) -
   order lifecycle management
 - `PolymarketClient` / `get_polymarket_client` ([execution/polymarket_client.py](../../execution/polymarket_client.py)) -

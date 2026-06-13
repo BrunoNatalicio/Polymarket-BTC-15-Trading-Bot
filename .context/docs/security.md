@@ -42,8 +42,9 @@ validating every external input that can trigger a trade (TradingView webhook pa
 
 ## Compliance & Policies
 
-- Hard position-size cap of $1 per trade, enforced in `execution/risk_engine.py` (`RiskLimits`) - this is the
-  primary loss-control mechanism and must not be bypassed by any code path.
+- Position-size cap per trade = the configured bet size (`MARKET_BUY_USD` env, default $1; currently $3),
+  enforced in `execution/risk_engine.py` (`RiskLimits`) - the primary loss-control mechanism. It scales with
+  the env var, but must not be bypassed by any code path.
 - Stop-loss/take-profit enforcement also lives in `RiskEngine`.
 - TradingView signals are time-bounded: anything older than `TRADINGVIEW_SIGNAL_TTL_SECONDS` (30s) is discarded to
   avoid acting on stale market conditions.

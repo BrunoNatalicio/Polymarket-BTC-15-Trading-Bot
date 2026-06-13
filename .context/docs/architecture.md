@@ -46,7 +46,7 @@ On each cycle the strategy either runs the fusion path (combine signals -> fuse 
   `event_dispatcher/dispatcher.py` is an internal pub/sub bus.
 - **Strategy brain** (`core/strategy_brain/`): `signal_processors/` (one `BaseSignalProcessor` subclass per signal),
   `fusion_engine/signal_fusion.py` (weighted voting -> `FusedSignal`), `strategies/btc_15min_strategy.py`.
-- **Execution** (`execution/`): `risk_engine.py` (sizing, $1 cap, stop-loss/take-profit),
+- **Execution** (`execution/`): `risk_engine.py` (sizing, `MARKET_BUY_USD` cap, stop-loss/take-profit),
   `execution_engine.py` (order lifecycle), `polymarket_client.py` (CLOB API wrapper),
   `nautilus_polymarket_integration.py` (bridges Nautilus events to execution + market slug resolution).
 - **Monitoring** (`monitoring/`): `performance_tracker.py` (trade outcomes), `grafana_exporter.py` (Prometheus
@@ -141,7 +141,7 @@ On each cycle the strategy either runs the fusion path (combine signals -> fuse 
 
 ## Risks & Constraints
 
-- Max position size capped at $1 by `execution/risk_engine.py` (`RiskLimits`).
+- Max position size capped at `MARKET_BUY_USD` (default $1, currently $3) by `execution/risk_engine.py` (`RiskLimits`); the daily-loss and exposure limits scale with it.
 - TradingView signals older than `TRADINGVIEW_SIGNAL_TTL_SECONDS` (30s) are discarded - the webhook path is
   latency-sensitive.
 - Max 1 trade per 15-minute market (`btc_trading:tv_last_traded_market`), persisted across the 90-minute

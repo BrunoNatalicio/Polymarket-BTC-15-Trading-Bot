@@ -102,6 +102,12 @@ QUOTE_STABILITY_REQUIRED = 3  # Need only 3 valid ticks to be stable (faster sta
 QUOTE_MIN_SPREAD = 0.001  # Both bid AND ask must be at least this
 MARKET_INTERVAL_SECONDS = 900  # 15-minute markets
 
+# Single source of truth for the bet size, in USD. Drives BOTH the dry-run
+# recorded amount and (via patch_market_orders reading the same env var) the
+# real live order, so dry run and live never diverge. The risk-engine caps
+# scale off the same env var. Change it in .env + restart — no code edit.
+POSITION_SIZE_USD = Decimal(os.getenv("MARKET_BUY_USD", "1.00"))
+
 
 @dataclass
 class PaperTrade:
@@ -1168,7 +1174,6 @@ class IntegratedBTCStrategy(Strategy):
             current_price=current_price,
         )
 
-        POSITION_SIZE_USD = Decimal("1.00")
         is_valid, error = self.risk_engine.validate_new_position(
             size=POSITION_SIZE_USD,
             direction=direction,
@@ -1178,7 +1183,10 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"Risk engine blocked TradingView trade: {error}")
             return
 
-        logger.info(f"Position size: $1.00 (fixed) | Direction: {direction.upper()}")
+        logger.info(
+            f"Position size: ${float(POSITION_SIZE_USD):.2f} (MARKET_BUY_USD) | "
+            f"Direction: {direction.upper()}"
+        )
 
         # Liquidity guard — same thresholds as the fusion path, but no retry
         # semantics (a webhook signal fires once; we don't re-arm the window).
@@ -1317,9 +1325,10 @@ class IntegratedBTCStrategy(Strategy):
         """
         Make trading decision using our 7-phase system.
 
-        Position size is always $1.00 — no variable sizing, no risk-engine
-        calculation needed. The risk engine is still used to check that we
-        don't already have too many open positions.
+        Position size is fixed at POSITION_SIZE_USD (the MARKET_BUY_USD env var,
+        default $1) — no variable sizing, no risk-engine calculation needed. The
+        risk engine is still used to check that we don't already have too many
+        open positions.
         """
         # --- Strategy exclusivity: skip fusion path when TradingView is active ---
         if self.get_active_strategy() != "fusion":
@@ -1368,8 +1377,8 @@ class IntegratedBTCStrategy(Strategy):
             f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
         )
 
-        # --- Phase 5: Position size is always exactly $1.00 ---
-        POSITION_SIZE_USD = Decimal("1.00")
+        # --- Phase 5: Position size is the fixed POSITION_SIZE_USD (module
+        # constant from MARKET_BUY_USD) ---
 
         # =========================================================================
         # TREND FILTER — replaces signal-based direction at the late trade window
@@ -1417,7 +1426,10 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"Risk engine blocked trade: {error}")
             return
 
-        logger.info(f"Position size: $1.00 (fixed) | Direction: {direction.upper()}")
+        logger.info(
+            f"Position size: ${float(POSITION_SIZE_USD):.2f} (MARKET_BUY_USD) | "
+            f"Direction: {direction.upper()}"
+        )
 
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.

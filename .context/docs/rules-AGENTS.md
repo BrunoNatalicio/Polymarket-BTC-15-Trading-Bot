@@ -31,7 +31,8 @@ first.
 ## Hard invariants
 
 - Dry run = full live order path with `submit_order` as the ONLY skipped call. Never add earlier branches.
-- $1 max position size (`execution/risk_engine.py`) — every path, no exceptions.
+- Bet size = `MARKET_BUY_USD` env (default $1, currently $3); `execution/risk_engine.py` caps every position
+  at it — every path, no exceptions.
 - `fusion` and `tradingview` strategies are mutually exclusive (`btc_trading:active_strategy`).
 - `tradingview_webhook_receiver.py` stays a separate process from `bot.py`.
 

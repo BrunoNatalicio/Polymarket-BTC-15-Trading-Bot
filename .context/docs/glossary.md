@@ -88,8 +88,9 @@ voting), and order execution on Polymarket's CLOB (YES/NO tokens, position sizin
 
 ## Domain Rules & Invariants
 
-- Maximum position size is capped at $1 (`RiskLimits` in `execution/risk_engine.py`) - a hard safety limit, not
-  a tunable default.
+- Maximum position size is capped at the configured bet size — the `MARKET_BUY_USD` env var (default $1,
+  currently $3) — enforced by `RiskLimits` in `execution/risk_engine.py`; the position cap and the daily-loss /
+  exposure limits scale with it (5×). Changing `MARKET_BUY_USD` (then restarting) is the intended way to resize.
 - Only one of `"fusion"` or `"tradingview"` can be the active strategy at a time
   (`btc_trading:active_strategy`); never both.
 - TradingView signals older than `TRADINGVIEW_SIGNAL_TTL_SECONDS` (30s) must be discarded.
