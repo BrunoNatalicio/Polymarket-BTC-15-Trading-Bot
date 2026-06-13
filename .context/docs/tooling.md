@@ -64,6 +64,10 @@ lets you change bot behavior without restarting or redeploying.
   live order path (writing to `tv_dry_run_trades.json`) without risking real funds.
 - `monitoring/grafana_exporter.py` exposes `/metrics` on port 8000 by default; pass `--no-grafana` to
   `15m_bot_runner.py`/`bot.py` if you don't need the metrics server during local iteration.
+- **Logs**: the bot, receiver, and recorder each tee their loguru output to a rotating file under `logs/`
+  (`bot.log`, `receiver.log`, `recorder.log`; 20 MB rotation, 14-day retention, UTF-8) in addition to their
+  console window — `tail` these to audit market selection, trades, and errors after the fact. Wired via
+  `log_setup.setup_file_logging`; these are operational logs, not `backtest.db`. `logs/` is gitignored.
 
 ## Related Resources
 

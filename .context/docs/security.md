@@ -11,7 +11,8 @@ scaffoldVersion: "2.0.0"
 ## Security & Compliance Notes
 
 This bot moves real money on a live exchange (Polymarket), so its main security guardrails are: keeping trading
-credentials out of source control, enforcing a hard position-size cap regardless of signal confidence, and
+credentials out of source control, enforcing a per-trade position-size cap (the `MARKET_BUY_USD` knob)
+regardless of signal confidence, and
 validating every external input that can trigger a trade (TradingView webhook payloads, Redis control keys).
 
 ## Authentication & Authorization

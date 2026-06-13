@@ -32,7 +32,7 @@ applies risk limits, and executes. For the architecture behind this, see [archit
 
 ## 2. Process Topology
 
-Two application processes plus the public tunnel:
+Three application processes (webhook receiver, bot, backtest recorder) plus the public tunnel:
 
 | Process | Command | Restarts? |
 | --- | --- | --- |
@@ -40,6 +40,7 @@ Two application processes plus the public tunnel:
 | Tunnel (production) | Named Cloudflare tunnel `tvbot` → `tvbot.<your-domain>`, run as a Windows **service** (setup in §3) | Auto — Windows service; survives reboot, logout, and bot restarts |
 | Tunnel (testing only) | `cloudflared tunnel --url http://localhost:8001` (or `ngrok http 8001`) | No — restart changes the throwaway `trycloudflare.com` URL |
 | Bot | `uv run python 15m_bot_runner.py --test-mode` (or `--live`) | Yes — supervisor restarts `bot.py` every ~90 min |
+| Backtest recorder | `uv run python -m backtest record` | No — keep it always up; records orderbooks + signals to `backtest/data/backtest.db` (irreplaceable data — Polymarket has no historical L2 API) |
 
 Production uses the **named tunnel** because it gives a stable hostname and runs as a service independent of any
 terminal — it does not need re-launching after a reboot or after the bot's 90-minute restarts. The quick tunnel
@@ -61,6 +62,13 @@ Restart semantics, stated plainly:
   short and deliberate.
 
 The receiver binds `127.0.0.1` only — nothing but the local tunnel can reach it directly.
+
+**Logs.** `start_tradingview_stack.ps1` runs each process in its own console window, and each also tees its
+loguru output to a rotating file under `logs/`: bot → `logs/bot.log`, receiver → `logs/receiver.log`,
+recorder → `logs/recorder.log` (20 MB rotation, 14-day retention, UTF-8, `enqueue` for thread safety). `tail`
+these to audit after the window scrolls — e.g. `Pre-subscribed NEXT market`, `Position size: $X.XX
+(MARKET_BUY_USD)`, market selection, and errors. These are **operational** logs, separate from `backtest.db`
+(the recorder's structured store). `logs/` and `*.log` are gitignored.
 
 ## 3. First-Time Setup
 
@@ -217,7 +225,7 @@ Run through in order; each step has a verification.
    make you stop and investigate is `IGNORED — fusion strategy active` (wrong strategy key) or frequent
    `Risk engine blocked` lines.
 6. Funds: the risk engine allows up to 5 concurrent positions of `MARKET_BUY_USD` each (exposure cap = 5×, so
-   $15 at the current $3 bet) — keep at least that much USDC in the Polymarket wallet so trades never fail on balance.
+   $15 at a $3 bet) — keep at least that much USDC in the Polymarket wallet so trades never fail on balance.
 7. `uv run python redis_control.py live` → type `yes` at the prompt.
 8. `uv run python redis_control.py dryrun off` — **the very next alert can submit a real order within
    seconds.** The safe procedure: pause the TradingView alerts, confirm the queue is empty
@@ -234,8 +242,9 @@ each arriving signal but logs `IGNORED — fusion strategy active` instead of tr
 ## 6. Day-to-Day Operations
 
 - **Status**: `uv run python redis_control.py status` — shows sim/live, active strategy, dry-run flag.
-- **Records**: live trades → bot log + Grafana; dry-run trades → `tv_dry_run_trades.json`; paper trades →
-  `paper_trades.json` (`uv run python view_paper_trades.py`).
+- **Records**: operational logs → `logs/{bot,receiver,recorder}.log` (rotating; see §2) + Grafana metrics;
+  dry-run trades → `tv_dry_run_trades.json`; paper trades → `paper_trades.json`
+  (`uv run python view_paper_trades.py`).
 - **Queue inspection** (rarely needed; redis-cli lives in WSL on this machine):
   ```bash
   wsl redis-cli -n 2 LRANGE btc_trading:tradingview_signals 0 -1   # pending signals

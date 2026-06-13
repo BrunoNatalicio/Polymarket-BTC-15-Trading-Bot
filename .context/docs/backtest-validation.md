@@ -70,7 +70,9 @@ uv run python -m backtest report --series 5m --signal-source tradingview_csv_300
 `report` flags: `--start/--end` (ISO date/datetime or unix seconds), `--series {15m,5m}`,
 `--signal-source` (SQL LIKE on `signals.source`, default `tradingview` = the live webhook stream),
 `--stake` (default `1.0`), `--bot-trades` (default `tv_dry_run_trades.json`). It runs `settle`
-internally, so a bare `report` is self-contained. Annotated output:
+internally, so a bare `report` is self-contained. Note: the **[BOT]** view scales to the stake the bot
+actually recorded (`MARKET_BUY_USD`, currently $3); **[ESTRATÉGIA]** uses `--stake` — pass `--stake 3` to
+compare the two like-for-like. Annotated output:
 
 ```
 FONTE DA VERDADE — SINAIS vs BOT (resolvido via CLOB)
@@ -157,10 +159,15 @@ data exposes — clear them before turning dry run off (also see
    `current_instrument_index`, and prices it from the pre-subscribed next market's own book, so
    entries land near $0.50 not $0.99. See `tv_market_select.py` (`select_target_market`,
    `fresh_quote`), `bot.py` (`_ensure_next_subscribed`, `_handle_tradingview_signal`), and the
-   `test_rollover_market_selection` test. Re-collect a dry-run night to confirm the $0.99 entries
-   are gone.
-2. **DOWN execution path** — ensure the NO-token instrument (`_no_instrument_id`) is loaded for the
-   active market so DOWN signals trade instead of silently dropping.
+   `test_rollover_market_selection` test. ✅ **Confirmed live (2026-06-13):** post-deploy webhook
+   trades land on the fresh N+1 window — e.g. an UP filled `YES @ $0.455` and a DOWN `NO @ $0.515`
+   while the expiring window's token sat at ~$0.99.
+2. **DOWN execution path** — ✅ **FIXED (side-effect of #1).** The webhook path now passes the target
+   market's `no_instrument_id` **explicitly** into `_place_real_order` (instead of the stale
+   `self._no_instrument_id`), so DOWN buys the freshly-selected, fully-loaded N+1 market's NO token.
+   Observed live (2026-06-13): a DOWN signal traded `NO @ $0.515` where before every DOWN dropped.
+   Watch that subsequent DOWN signals keep converting (a market loaded without its NO token could
+   still drop).
 3. **Polymarket API key 401** — credentials in `.env` are invalid; dry run masks it
    (`submit_order` skipped). Regenerate `POLYMARKET_API_KEY`/`SECRET`/`PASSPHRASE` before live, or
    the first real order fails with 401 (see runbook §7).

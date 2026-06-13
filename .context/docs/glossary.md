@@ -23,7 +23,7 @@ voting), and order execution on Polymarket's CLOB (YES/NO tokens, position sizin
   `SignalFusionEngine` with `score` and `confidence`
 - [`Order`](../../execution/execution_engine.py:52) - represents an order through its lifecycle
 - [`PositionRisk`](../../execution/risk_engine.py:37) - per-position risk state used by `RiskEngine`
-- [`RiskLimits`](../../execution/risk_engine.py:25) - configured risk thresholds (incl. max-$1 cap)
+- [`RiskLimits`](../../execution/risk_engine.py:25) - configured risk thresholds (position cap = `MARKET_BUY_USD`)
 - [`Trade`](../../monitoring/performance_tracker.py:16) / [`PerformanceMetrics`](../../monitoring/performance_tracker.py:34) -
   recorded trade outcome and aggregated metrics
 - [`SignalPerformance`](../../feedback/learning_engine.py:22) - per-signal performance used to re-weight fusion
