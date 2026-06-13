@@ -252,6 +252,10 @@ class Recorder:
 
 
 def main() -> int:
+    from log_setup import setup_file_logging
+
+    setup_file_logging("recorder.log")
+
     poll_seconds = float(os.getenv("BACKTEST_POLL_SECONDS", "2.0"))
     depth = int(os.getenv("BACKTEST_BOOK_DEPTH", "20"))
     series = [

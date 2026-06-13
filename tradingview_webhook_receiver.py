@@ -191,6 +191,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
+    from log_setup import setup_file_logging
+
+    setup_file_logging("receiver.log")
+
     secret = os.getenv("TRADINGVIEW_WEBHOOK_SECRET", "").strip()
     if not secret:
         logger.error(

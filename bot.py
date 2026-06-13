@@ -2013,6 +2013,14 @@ def run_integrated_bot(
 
 
 def main():
+    # Tee loguru output to a rotating file so each run is auditable after the
+    # fact (the stack launches each component in its own console window with no
+    # file sink). Operational log only — NOT backtest.db (recorder's domain).
+    from log_setup import setup_file_logging
+
+    setup_file_logging("bot.log")
+    logger.info("File logging enabled -> logs/bot.log")
+
     import argparse
 
     parser = argparse.ArgumentParser(description="Integrated BTC 15-Min Trading Bot")
