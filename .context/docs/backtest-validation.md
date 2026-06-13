@@ -75,12 +75,13 @@ internally, so a bare `report` is self-contained. Annotated output:
 ```
 FONTE DA VERDADE — SINAIS vs BOT (resolvido via CLOB)
 Período : 2026-06-12 00:00 -> 2026-06-13 10:25 UTC | série 15m | fonte=tradingview
+Série   : 15m | fonte=tradingview | stake=$1.00 | fee=0.07 (taker, em shares)
 [ESTRATÉGIA] sinal -> janela N+1 -> CLOB
   Sinais recebidos : 10
   Resolvidos       : 10 -> 7 WIN / 3 LOSS (70%)   # graded against the CLOB
     UP  : 7 sinais | 4 WIN | 57%
     DOWN: 3 sinais | 3 WIN | 100%
-  PnL              : $+4.14 sobre $10.00 | slip 7 bps   # fill simulado no ask real; slip = slippage em basis points
+  PnL              : $+4.14 sobre $10.00 | slip 7 bps   # PnL líquido do taker fee; slip em basis points
 [BOT] trades realmente executados
   Convertidos      : 9 de 10 sinais (dropados: 1)        # signals received vs trades executed
   Resolvidos       : 8 -> 6 WIN / 2 LOSS (75%)  (sem CLOB: 1)   # sem CLOB = sem book gravado decisivo p/ resolver
@@ -88,6 +89,10 @@ Período : 2026-06-12 00:00 -> 2026-06-13 10:25 UTC | série 15m | fonte=trading
 [GAP] sinais recebidos que o bot NÃO negociou:
     2026-06-13 03:30:03 UTC  DOWN                         # o DOWN dropado: 03:30 UTC = 00:30 local (§5)
 ```
+
+> Os números `$+4.14`/`$+4.10` acima são do primeiro registro (era zero-fee) e estão **brutos**. Com
+> `--fee-rate 0.07` (default) o PnL agora sai **líquido** do taker fee — re-rode o `report` para os
+> valores atuais; o custo é maior nas entradas perto de $0.50.
 
 The report prints timestamps in **UTC**; §5 below narrates in **local time (UTC-3)** — the same
 dropped DOWN is `03:30 UTC` in the output and `00:30` in the findings.
@@ -110,6 +115,19 @@ The same signal can read as WIN in one view and LOSS in the other — that gap i
 
 PnL model (both views): buying `$stake` at price `p` yields `stake/p` tokens; each winning token
 redeems `$1`. `pnl = payout − stake` (identical to `settlement.settle_fill`).
+
+**Taker fee (15m/5m crypto).** These markets are no longer zero-fee: the taker pays
+`fee = C × feeRate × p × (1 − p)` — where `C` is the number of shares traded (`stake / p`) — crypto
+`feeRate = 0.07`, **collected in shares on a buy**, so a
+win pays out fewer shares while a loss is unchanged (you still lose the full stake). The fee is
+symmetric around `p = 0.50` (its peak, ~3.5% of notional) and negligible at the extremes — so it
+bites hardest on the fresh ~$0.50 entries the rollover fix now targets. Both views net it out:
+`matching.simulate_market_buy(fee_rate=…)` skims it from `filled_tokens`, and
+`bot_trades.evaluate_bot_trades(fee_rate=…)` does the same from the bot's logged entry. `report`
+and `replay` default `--fee-rate 0.07`; pass `--fee-rate 0` for non-fee markets. Maker orders pay
+zero, but the bot sends **market (taker)** orders, so the fee applies. Always prefer the live
+`feeRate` per market (`feesEnabled`/`getClobMarketInfo`) over the hardcoded default — Polymarket
+changes it without notice.
 
 ## 5. Findings (2026-06-12 → 13, first live night)
 
@@ -134,9 +152,13 @@ Fixing these is **out of scope for the report** (it only measures), but they are
 data exposes — clear them before turning dry run off (also see
 [tradingview-runbook.md](tradingview-runbook.md) §5):
 
-1. **Market selection at rollover** — when the current market is seconds from expiry, the webhook
-   path should target the **next** window (match `attach_target_tokens`' N+1 mapping) so entries
-   land near $0.50, not $0.99.
+1. **Market selection at rollover** — ✅ **FIXED.** The webhook path now picks the market by wall
+   clock (`floor(now/900)*900`, identical to `attach_target_tokens`' N+1 mapping) instead of
+   `current_instrument_index`, and prices it from the pre-subscribed next market's own book, so
+   entries land near $0.50 not $0.99. See `tv_market_select.py` (`select_target_market`,
+   `fresh_quote`), `bot.py` (`_ensure_next_subscribed`, `_handle_tradingview_signal`), and the
+   `test_rollover_market_selection` test. Re-collect a dry-run night to confirm the $0.99 entries
+   are gone.
 2. **DOWN execution path** — ensure the NO-token instrument (`_no_instrument_id`) is loaded for the
    active market so DOWN signals trade instead of silently dropping.
 3. **Polymarket API key 401** — credentials in `.env` are invalid; dry run masks it

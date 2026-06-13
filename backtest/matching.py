@@ -12,9 +12,10 @@ _EPS = 1e-9
 
 @dataclass(frozen=True)
 class FillResult:
-    filled_usd: float
-    filled_tokens: float
-    vwap: float  # filled_usd / filled_tokens (0.0 when nothing filled)
+    filled_usd: float  # USDC spent into the book (the stake, capped by depth)
+    filled_tokens: float  # NET shares received, after the taker fee is skimmed
+    fee_usd: float  # taker fee in USDC: C × fee_rate × p × (1−p), 0 when fee_rate=0
+    vwap: float  # gross avg fill price = filled_usd / gross_tokens (0 if nothing)
     best_quote: float  # top-of-book price before the walk (0.0 if empty book)
     slippage: float  # vwap - best_quote for buys (signed)
     slippage_bps: float
@@ -26,6 +27,7 @@ def _zero_fill(best_quote: float = 0.0) -> FillResult:
     return FillResult(
         filled_usd=0.0,
         filled_tokens=0.0,
+        fee_usd=0.0,
         vwap=0.0,
         best_quote=best_quote,
         slippage=0.0,
@@ -44,16 +46,20 @@ def simulate_market_buy(
 
     `asks` must be best-first (ascending price): [(price, size_tokens), ...].
     Returns a partial fill with exhausted=True when the book is too thin.
-    Fees reduce the budget available for tokens: effective stake is
-    stake_usd / (1 + fee_rate); reported filled_usd includes fees paid.
+
+    Taker fee (Polymarket 15m/5m crypto): `fee = C × fee_rate × p × (1−p)` per
+    matched lot, collected in SHARES on a buy. The full `stake_usd` is spent;
+    the fee is skimmed from the shares received, so `filled_tokens` is NET of
+    fee (`gross − fee_usd / vwap`) while `filled_usd` stays the stake. With the
+    default `fee_rate=0.0` this is a no-op (non-fee markets / back-compat).
     """
     if stake_usd <= 0 or not asks:
         return _zero_fill(best_quote=asks[0][0] if asks else 0.0)
 
     best_quote = asks[0][0]
-    budget = stake_usd / (1.0 + fee_rate)
-    remaining = budget
+    remaining = stake_usd
     tokens = 0.0
+    fee_usd = 0.0
     levels = 0
 
     for price, size in asks:
@@ -63,21 +69,26 @@ def simulate_market_buy(
             continue
         level_usd = price * size
         take_usd = min(remaining, level_usd)
-        tokens += take_usd / price
+        take_tokens = take_usd / price
+        tokens += take_tokens
+        # Fee is per-lot at the lot's own price (exact across levels), not on vwap.
+        fee_usd += take_tokens * fee_rate * price * (1.0 - price)
         remaining -= take_usd
         levels += 1
 
-    spent = budget - remaining
+    spent = stake_usd - remaining
     if tokens <= _EPS or spent <= _EPS:
         return _zero_fill(best_quote=best_quote)
 
-    filled_usd = spent * (1.0 + fee_rate)
     vwap = spent / tokens
+    # Fee skimmed in shares; net shares are what you hold into resolution.
+    net_tokens = max(0.0, tokens - (fee_usd / vwap if vwap > 0 else 0.0))
     slippage = vwap - best_quote
     slippage_bps = (slippage / best_quote) * 10_000 if best_quote > 0 else 0.0
     return FillResult(
-        filled_usd=filled_usd,
-        filled_tokens=tokens,
+        filled_usd=spent,
+        filled_tokens=net_tokens,
+        fee_usd=fee_usd,
         vwap=vwap,
         best_quote=best_quote,
         slippage=slippage,
@@ -123,9 +134,12 @@ def simulate_market_sell(
     vwap = proceeds / sold
     slippage = best_quote - vwap
     slippage_bps = (slippage / best_quote) * 10_000 if best_quote > 0 else 0.0
+    # Sell path is unused by the buy-and-hold-to-expiry strategy; keep the simple
+    # notional fee here (fee_usd left 0.0 — the p(1−p) model is buy-side only).
     return FillResult(
         filled_usd=proceeds * (1.0 - fee_rate),
         filled_tokens=sold,
+        fee_usd=0.0,
         vwap=vwap,
         best_quote=best_quote,
         slippage=slippage,

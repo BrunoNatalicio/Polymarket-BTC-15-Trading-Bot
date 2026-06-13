@@ -83,6 +83,7 @@ from execution.risk_engine import get_risk_engine
 from feedback.learning_engine import get_learning_engine
 from monitoring.grafana_exporter import get_grafana_exporter
 from monitoring.performance_tracker import get_performance_tracker
+from tv_market_select import fresh_quote, select_target_market
 
 load_dotenv()
 from patch_market_orders import apply_market_order_patch
@@ -185,6 +186,13 @@ class IntegratedBTCStrategy(Strategy):
         self._last_bid_ask = (
             None  # (bid_decimal, ask_decimal) from last tick, for liquidity checks
         )
+        # Per-instrument latest quote {instrument_id: (bid, ask, epoch_ts)}.
+        # Lets a TradingView signal price the FRESH (N+1) market at rollover
+        # instead of the expiring one — see tv_market_select / _ensure_next_subscribed.
+        self._last_quote_by_instrument: dict = {}
+        # Instruments we've already subscribed to (avoid duplicate subscriptions
+        # when pre-subscribing the next market).
+        self._subscribed_instruments: set = set()
 
         # Tick buffer: rolling 90s of ticks for TickVelocityProcessor
         from collections import deque
@@ -685,7 +693,31 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("  Trade timer reset — will trade on next tick")
 
         self.subscribe_quote_ticks(self.instrument_id)
+        self._ensure_next_subscribed()
         return True
+
+    def _ensure_next_subscribed(self):
+        """Pre-subscribe the next market (N+1) so its book is warm before rollover.
+
+        A TradingView alert fires at the bar close = window expiry; without a
+        live quote for the freshly-opened window the signal would trade the
+        expiring ~$0.99 book (no edge) or be discarded. Subscribing ahead keeps
+        `_last_quote_by_instrument` fresh for N+1. Idempotent via
+        `_subscribed_instruments`.
+        """
+        idx = self.current_instrument_index
+        if idx < 0 or idx + 1 >= len(self.all_btc_instruments):
+            return
+        nxt = self.all_btc_instruments[idx + 1]
+        inst_id = nxt["instrument"].id
+        if inst_id in self._subscribed_instruments:
+            return
+        try:
+            self.subscribe_quote_ticks(inst_id)
+            self._subscribed_instruments.add(inst_id)
+            logger.info(f"  ✓ Pre-subscribed NEXT market: {nxt['slug']}")
+        except Exception as e:
+            logger.warning(f"Could not pre-subscribe next market: {e}")
 
     # ------------------------------------------------------------------
     # Timer loop - SIMPLIFIED
@@ -718,6 +750,10 @@ class IntegratedBTCStrategy(Strategy):
                 return
 
             now = datetime.now(UTC)
+
+            # Keep the next market (N+1) pre-subscribed so its book is warm
+            # before the rollover boundary (cheap; idempotent).
+            self._ensure_next_subscribed()
 
             if self.next_switch_time and now >= self.next_switch_time:
                 if self._waiting_for_market_open:
@@ -759,10 +795,6 @@ class IntegratedBTCStrategy(Strategy):
     def on_quote_tick(self, tick: QuoteTick):
         """Handle quote tick - TRADE when market opens and at each 15-min boundary"""
         try:
-            # Only process ticks from current instrument
-            if self.instrument_id is None or tick.instrument_id != self.instrument_id:
-                return
-
             now = datetime.now(UTC)
             bid = tick.bid_price
             ask = tick.ask_price
@@ -774,6 +806,20 @@ class IntegratedBTCStrategy(Strategy):
                 bid_decimal = bid.as_decimal()
                 ask_decimal = ask.as_decimal()
             except:
+                return
+
+            # Cache the latest quote for EVERY subscribed instrument (current AND
+            # the pre-subscribed next market). At rollover a TradingView signal
+            # prices the fresh N+1 market from this cache instead of the expiring
+            # one — see _handle_tradingview_signal / _ensure_next_subscribed.
+            self._last_quote_by_instrument[tick.instrument_id] = (
+                bid_decimal,
+                ask_decimal,
+                time.time(),
+            )
+
+            # Everything below is the fusion trading path — current market only.
+            if self.instrument_id is None or tick.instrument_id != self.instrument_id:
                 return
 
             # Always store price history
@@ -990,24 +1036,48 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"TV signal invalid, dropped: {signal!r}")
             return
 
-        if (
-            self._waiting_for_market_open
-            or self.current_instrument_index < 0
-            or self.current_instrument_index >= len(self.all_btc_instruments)
-        ):
-            logger.warning(f"TV signal {signal} DISCARDED — no active market")
+        if not self.all_btc_instruments:
+            logger.warning(f"TV signal {signal} DISCARDED — no markets loaded")
             return
+
+        # Pick the market by WALL CLOCK, not current_instrument_index. The alert
+        # fires at the bar close = window expiry, so floor(now/900)*900 lands on
+        # the freshly-opened N+1 window (~$0.50), never the expiring one (~$0.99).
+        # Identical mapping to the backtest's attach_target_tokens.
+        now_ts = time.time()
+        target_market = select_target_market(self.all_btc_instruments, now_ts)
+        if target_market is None:
+            target_ws = (
+                int(now_ts) // MARKET_INTERVAL_SECONDS
+            ) * MARKET_INTERVAL_SECONDS
+            logger.warning(
+                f"TV signal {signal} DISCARDED — no market loaded for current "
+                f"15m window (start={target_ws})"
+            )
+            return
+
+        # Price the FRESH market from its own (pre-subscribed) book. No fresh
+        # quote => discard rather than fall back to the expiring window.
+        target_instrument_id = target_market["instrument"].id
+        quote = fresh_quote(
+            self._last_quote_by_instrument,
+            target_instrument_id,
+            now_ts,
+            max_age_s=self._tv_signal_ttl,
+        )
+        if quote is None:
+            logger.warning(
+                f"TV signal {signal} DISCARDED — no fresh quote for target market "
+                f"{target_market['slug']} (book not warm yet)"
+            )
+            return
+        bid_d, ask_d = quote
+        mid_price = (bid_d + ask_d) / 2
 
         # One trade per 15-min market. Dedup key lives in Redis so the
         # 90-min auto-restart can't cause a double trade in the same market.
-        current_market = self.all_btc_instruments[self.current_instrument_index]
-        market_start_ts = current_market["market_timestamp"]
-        elapsed_secs = time.time() - market_start_ts
-        if elapsed_secs < 0:
-            logger.warning(f"TV signal {signal} DISCARDED — market not open yet")
-            return
-        sub_interval = int(elapsed_secs // MARKET_INTERVAL_SECONDS)
-        dedup_value = f"{market_start_ts}:{sub_interval}"
+        market_start_ts = target_market["market_timestamp"]
+        dedup_value = f"{int(market_start_ts)}:0"
         try:
             already_traded = redis_client.get("btc_trading:tv_last_traded_market")
         except Exception as e:
@@ -1021,28 +1091,22 @@ class IntegratedBTCStrategy(Strategy):
             )
             return
 
-        last_tick = getattr(self, "_last_bid_ask", None)
-        if not last_tick:
-            logger.warning(f"TV signal {signal} DISCARDED — no quote yet for market")
-            return
-        mid_price = (last_tick[0] + last_tick[1]) / 2
-
         # Claim the market before executing (consumer is single-threaded)
         redis_client.set("btc_trading:tv_last_traded_market", dedup_value, ex=3600)
 
         logger.info("=" * 80)
         logger.info(
             f" TRADINGVIEW SIGNAL TRADE: {signal} | age {age:.1f}s | "
-            f"price ${float(mid_price):.4f} | market {current_market['slug']}"
+            f"price ${float(mid_price):.4f} | market {target_market['slug']}"
         )
         logger.info("=" * 80)
 
         self._execute_webhook_trade_sync(
-            signal, float(mid_price), current_market.get("slug", "")
+            signal, float(mid_price), target_market, (bid_d, ask_d)
         )
 
     def _execute_webhook_trade_sync(
-        self, signal: str, current_price: float, market_slug: str = ""
+        self, signal: str, current_price: float, target_market: dict, bid_ask: tuple
     ):
         """Synchronous wrapper (consumer thread owns its own event loop)."""
         price_decimal = Decimal(str(current_price))
@@ -1050,13 +1114,15 @@ class IntegratedBTCStrategy(Strategy):
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(
-                self._execute_webhook_trade(signal, price_decimal, market_slug)
+                self._execute_webhook_trade(
+                    signal, price_decimal, target_market, bid_ask
+                )
             )
         finally:
             loop.close()
 
     async def _execute_webhook_trade(
-        self, signal: str, current_price: Decimal, market_slug: str = ""
+        self, signal: str, current_price: Decimal, target_market: dict, bid_ask: tuple
     ):
         """
         Execute a TradingView signal directly — no fusion, no trend filter.
@@ -1065,11 +1131,21 @@ class IntegratedBTCStrategy(Strategy):
         applies the risk engine, the liquidity guard, and the sim/live gate
         (identical to the tail of _make_trading_decision).
 
+        `target_market` is the FRESH (N+1) market chosen by wall clock and
+        `bid_ask` its live quote — so the order, liquidity guard, and token
+        ids all bind to that market, not whatever `current_instrument_index`
+        happens to point at (the rollover fix).
+
         Dry run (btc_trading:tv_dry_run = "1"): runs the EXACT live order
         path — token resolution, instrument cache, qty/precision, order
         construction — and diverges at a single point: submit_order is not
         called. 100% fidelity with live except the submission itself.
         """
+        market_slug = target_market.get("slug", "")
+        yes_instrument_id = (
+            target_market.get("yes_instrument_id") or target_market["instrument"].id
+        )
+        no_instrument_id = target_market.get("no_instrument_id")
         is_simulation = await self.check_simulation_mode()
         tv_dry_run = self.check_tv_dry_run()
         if tv_dry_run:
@@ -1105,23 +1181,22 @@ class IntegratedBTCStrategy(Strategy):
         logger.info(f"Position size: $1.00 (fixed) | Direction: {direction.upper()}")
 
         # Liquidity guard — same thresholds as the fusion path, but no retry
-        # semantics (a webhook signal fires once; we don't re-arm the window)
-        last_tick = getattr(self, "_last_bid_ask", None)
-        if last_tick:
-            last_bid, last_ask = last_tick
-            MIN_LIQUIDITY = Decimal("0.02")
-            if direction == "long" and last_ask <= MIN_LIQUIDITY:
-                logger.warning(
-                    f"⚠ No liquidity for BUY: ask=${float(last_ask):.4f} — "
-                    "skipping TradingView trade"
-                )
-                return
-            if direction == "short" and last_bid <= MIN_LIQUIDITY:
-                logger.warning(
-                    f"⚠ No liquidity for SELL: bid=${float(last_bid):.4f} — "
-                    "skipping TradingView trade"
-                )
-                return
+        # semantics (a webhook signal fires once; we don't re-arm the window).
+        # Uses the TARGET market's quote, not self._last_bid_ask (current market).
+        last_bid, last_ask = bid_ask
+        MIN_LIQUIDITY = Decimal("0.02")
+        if direction == "long" and last_ask <= MIN_LIQUIDITY:
+            logger.warning(
+                f"⚠ No liquidity for BUY: ask=${float(last_ask):.4f} — "
+                "skipping TradingView trade"
+            )
+            return
+        if direction == "short" and last_bid <= MIN_LIQUIDITY:
+            logger.warning(
+                f"⚠ No liquidity for SELL: bid=${float(last_bid):.4f} — "
+                "skipping TradingView trade"
+            )
+            return
 
         if tv_dry_run:
             # Dry run takes precedence over sim/live: rehearse the live path
@@ -1132,6 +1207,8 @@ class IntegratedBTCStrategy(Strategy):
                 direction,
                 dry_run=True,
                 market_slug=market_slug,
+                yes_instrument_id=yes_instrument_id,
+                no_instrument_id=no_instrument_id,
             )
         elif is_simulation:
             await self._record_paper_trade(
@@ -1139,7 +1216,13 @@ class IntegratedBTCStrategy(Strategy):
             )
         else:
             await self._place_real_order(
-                tv_signal, POSITION_SIZE_USD, current_price, direction
+                tv_signal,
+                POSITION_SIZE_USD,
+                current_price,
+                direction,
+                market_slug=market_slug,
+                yes_instrument_id=yes_instrument_id,
+                no_instrument_id=no_instrument_id,
             )
 
     async def _fetch_market_context(self, current_price: Decimal) -> dict:
@@ -1456,13 +1539,28 @@ class IntegratedBTCStrategy(Strategy):
         direction,
         dry_run: bool = False,
         market_slug: str = "",
+        yes_instrument_id=None,
+        no_instrument_id=None,
     ):
         """
         Place a real order. With dry_run=True the ENTIRE path runs identically
         (token resolution, instrument cache, qty/precision, order construction)
         and diverges at exactly one point: submit_order is not called.
+
+        `yes_instrument_id`/`no_instrument_id` override the current-market token
+        ids — the webhook path passes the TARGET (N+1) market's ids so the order
+        binds to the fresh window. They default to the current market's ids
+        (`self._yes_instrument_id`/`self._no_instrument_id`) for the fusion path.
         """
-        if not self.instrument_id:
+        yes_instrument_id = yes_instrument_id or getattr(
+            self, "_yes_instrument_id", self.instrument_id
+        )
+        no_instrument_id = (
+            no_instrument_id
+            if no_instrument_id is not None
+            else getattr(self, "_no_instrument_id", None)
+        )
+        if not yes_instrument_id:
             logger.error("No instrument available")
             return
 
@@ -1483,19 +1581,16 @@ class IntegratedBTCStrategy(Strategy):
             side = OrderSide.BUY
 
             if direction == "long":
-                trade_instrument_id = getattr(
-                    self, "_yes_instrument_id", self.instrument_id
-                )
+                trade_instrument_id = yes_instrument_id
                 trade_label = "YES (UP)"
             else:
-                no_id = getattr(self, "_no_instrument_id", None)
-                if no_id is None:
+                if no_instrument_id is None:
                     logger.warning(
                         "NO token instrument not found for this market — "
                         "cannot bet DOWN. Skipping trade."
                     )
                     return
-                trade_instrument_id = no_id
+                trade_instrument_id = no_instrument_id
                 trade_label = "NO (DOWN)"
 
             instrument = self.cache.instrument(trade_instrument_id)

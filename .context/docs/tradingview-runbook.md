@@ -192,8 +192,12 @@ market against the recorded Polymarket CLOB and reports strategy-vs-bot hit-rate
 uv run python -m backtest report --signal-source tradingview
 ```
 See [backtest-validation.md](backtest-validation.md) for the outcome model and how to read the two views. For a
-$1 binary market the hit rate must beat the average entry price (e.g. entries around $0.60 need >60% accuracy to
-be profitable). When satisfied, proceed to §5.
+$1 binary market the hit rate must beat the average entry price **plus the taker fee** (15m/5m crypto charge
+`fee = C × feeRate × p × (1 − p)`, where `C` = shares traded (`stake/p`), crypto `feeRate = 0.07`, charged in
+shares — see backtest-validation.md §4).
+The fee peaks near $0.50, which is exactly where the rollover fix now lands entries, so it is not negligible:
+e.g. entries around $0.50 need meaningfully more than 50% accuracy once the ~3.5%-of-notional fee is paid. Run
+`report` with the default `--fee-rate 0.07` to read the **net** PnL. When satisfied, proceed to §5.
 
 ## 5. Go-Live Checklist
 

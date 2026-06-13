@@ -40,12 +40,19 @@ def _window_start_from_slug(slug: str) -> int | None:
 
 
 def evaluate_bot_trades(
-    con: sqlite3.Connection, trades: list[dict[str, Any]]
+    con: sqlite3.Connection,
+    trades: list[dict[str, Any]],
+    fee_rate: float = 0.0,
 ) -> dict[str, Any]:
     """Resolve cada trade do bot via CLOB e agrega WIN/LOSS + PnL.
 
     PnL segue o modelo de ``settlement.settle_fill``: comprar ``usd`` ao preço
     ``price`` rende ``usd/price`` tokens; cada token vencedor paga $1.
+
+    Taker fee (15m/5m crypto): ``fee = C × fee_rate × p × (1−p)``, cobrado em
+    SHARES na compra — derruba o payout da vitória (menos shares) e não afeta a
+    derrota (perde-se o ``usd`` cheio). ``fee_rate=0.0`` desliga (mercados sem
+    fee). O preço logado pelo bot é o avg pago, usado como ``p``.
     """
     wins = losses = unresolved = 0
     pnl = staked = 0.0
@@ -66,7 +73,10 @@ def evaluate_bot_trades(
         else:
             won = side == outcome
             tokens = usd / price
-            payout = tokens if won else 0.0
+            # Taker fee skimmed in shares: net = gross − fee_usd/price.
+            fee_usd = tokens * fee_rate * price * (1.0 - price)
+            net_tokens = tokens - (fee_usd / price if price > 0 else 0.0)
+            payout = net_tokens if won else 0.0
             row_pnl = payout - usd
             pnl += row_pnl
             staked += usd

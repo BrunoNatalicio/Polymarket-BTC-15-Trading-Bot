@@ -149,13 +149,29 @@ def test_depth_walk():
     fill = simulate_market_buy([], stake_usd=50.0)
     check("empty book: zero fill", fill.filled_tokens == 0.0 and fill.exhausted)
 
-    # Fees reduce token budget
-    fill = simulate_market_buy([(0.50, 1000.0)], stake_usd=50.0, fee_rate=0.02)
-    check(
-        "fee reduces tokens (50/1.02/0.5)",
-        abs(fill.filled_tokens - 50.0 / 1.02 / 0.5) < 1e-9,
-    )
-    check("filled_usd includes fee", abs(fill.filled_usd - 50.0) < 1e-9)
+    # Polymarket 15m-crypto taker fee: fee = C × r × p × (1−p), collected in
+    # SHARES on a buy. At p=0.50 the fee peaks. stake $50 at 0.50 -> gross 100
+    # shares; fee_usd = 100 × 0.07 × 0.5 × 0.5 = $1.75; fee_shares = 1.75/0.50
+    # = 3.5; net 96.5 shares. The full $50 is still spent.
+    fill = simulate_market_buy([(0.50, 1000.0)], stake_usd=50.0, fee_rate=0.07)
+    check("fee_usd = C*r*p*(1-p) at 0.50", abs(fill.fee_usd - 1.75) < 1e-9)
+    check("fee skimmed in shares -> net 96.5", abs(fill.filled_tokens - 96.5) < 1e-9)
+    check("filled_usd unchanged by fee ($50)", abs(fill.filled_usd - 50.0) < 1e-9)
+    check("vwap is the gross avg (0.50)", abs(fill.vwap - 0.50) < 1e-12)
+
+    # Fee is symmetric around 0.50: 100 shares at 0.30 vs 0.70 cost the same.
+    f30 = simulate_market_buy([(0.30, 1000.0)], stake_usd=30.0, fee_rate=0.07)
+    f70 = simulate_market_buy([(0.70, 1000.0)], stake_usd=70.0, fee_rate=0.07)
+    check("fee symmetric 0.30 vs 0.70", abs(f30.fee_usd - f70.fee_usd) < 1e-9)
+
+    # Negligible at the extremes: 100 shares at 0.99 -> 100×0.07×0.99×0.01 ≈ $0.069
+    f99 = simulate_market_buy([(0.99, 1000.0)], stake_usd=99.0, fee_rate=0.07)
+    check("fee negligible at 0.99", f99.fee_usd < 0.08)
+
+    # Default fee_rate=0 -> no fee, full shares (back-compat / non-fee markets).
+    fill = simulate_market_buy([(0.50, 1000.0)], stake_usd=50.0)
+    check("no fee by default -> 100 shares", abs(fill.filled_tokens - 100.0) < 1e-9)
+    check("fee_usd zero by default", fill.fee_usd == 0.0)
 
 
 def test_settlement():
@@ -381,11 +397,17 @@ def test_bot_trades():
             "market_slug": sb,
         },
     ]
-    res = evaluate_bot_trades(con, trades)
+    res = evaluate_bot_trades(con, trades, fee_rate=0.0)
     check("1 win / 1 loss", res["wins"] == 1 and res["losses"] == 1)
     check("win rate 50%", abs(res["win_rate"] - 0.5) < 1e-9)
     check("pnl 0.0 (+1 -1)", abs(res["total_pnl"] - 0.0) < 1e-9)
     check("staked $2", abs(res["total_staked"] - 2.0) < 1e-9)
+
+    # With the 15m-crypto taker fee, the WIN at 0.50 pays less (fee skimmed in
+    # shares: 2 - 0.035/0.5 = 1.93 -> pnl +0.93) while the LOSS stays -1.00.
+    # Net total moves from 0.00 to -0.07 (the fee on the winning leg).
+    res_fee = evaluate_bot_trades(con, trades, fee_rate=0.07)
+    check("with fee: total pnl -0.07", abs(res_fee["total_pnl"] - (-0.07)) < 1e-9)
     con.close()
 
 

@@ -171,6 +171,68 @@ def test_extra_fields():
     check("no secret in built message", "secret" not in msg)
 
 
+def test_rollover_market_selection():
+    print("\n8. rollover market selection (N+1 window, fresh quote)")
+    from tv_market_select import (
+        fresh_quote,
+        select_target_market,
+        target_window_start,
+    )
+
+    W = 900
+    # Two adjacent 15-min windows: N expiring at :15, N+1 fresh starting at :15.
+    n_start = 1_781_308_800  # multiple of 900
+    n1_start = n_start + W
+    instruments = [
+        {"market_timestamp": n_start, "slug": f"btc-updown-15m-{n_start}", "id": "N"},
+        {
+            "market_timestamp": n1_start,
+            "slug": f"btc-updown-15m-{n1_start}",
+            "id": "N1",
+        },
+    ]
+
+    # target_window_start floors to the window CONTAINING now (matches the
+    # backtest's attach_target_tokens: floor(ts/900)*900).
+    check("mid-N window -> N", target_window_start(n_start + 100, W) == n_start)
+    check("exactly at boundary -> N+1", target_window_start(n1_start, W) == n1_start)
+    check(
+        "just after boundary -> N+1", target_window_start(n1_start + 2, W) == n1_start
+    )
+
+    # The signal fires AT the bar close (= N+1 start). The bot must pick the
+    # FRESH window, not the one that just expired.
+    boundary = select_target_market(instruments, n1_start + 2.0, W)
+    check(
+        "boundary signal picks N+1 (fresh)",
+        boundary is not None and boundary["id"] == "N1",
+    )
+
+    mid = select_target_market(instruments, n_start + 300.0, W)
+    check("mid-window signal picks N", mid is not None and mid["id"] == "N")
+
+    # No market loaded for the target window -> None (caller discards, never
+    # falls back to the expiring market).
+    missing = select_target_market(instruments, n1_start + W + 5.0, W)
+    check("no market for window -> None", missing is None)
+
+    # Fresh-quote cache: N expiring asks ~0.99, N+1 fresh asks ~0.50.
+    now = float(n1_start + 2)
+    cache = {
+        "N": (0.985, 0.99, now - 1.0),  # near-resolved, but NOT the target
+        "N1": (0.495, 0.505, now - 1.0),  # fresh book, this is what we want
+    }
+    q = fresh_quote(cache, "N1", now, max_age_s=30.0)
+    check(
+        "fresh quote returns N+1 book (~0.50, not 0.99)",
+        q is not None and q[1] == 0.505,
+    )
+
+    stale = {"N1": (0.495, 0.505, now - 120.0)}
+    check("stale quote rejected", fresh_quote(stale, "N1", now, max_age_s=30.0) is None)
+    check("missing quote -> None", fresh_quote({}, "N1", now) is None)
+
+
 def test_redis_roundtrip():
     print("\n5. Redis round-trip")
     client = get_redis_client()
@@ -307,6 +369,7 @@ def main() -> int:
     test_staleness()
     test_direction_mapping()
     test_extra_fields()
+    test_rollover_market_selection()
     test_redis_roundtrip()
     test_http_end_to_end()
 

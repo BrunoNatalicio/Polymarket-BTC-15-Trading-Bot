@@ -62,6 +62,15 @@ voting), and order execution on Polymarket's CLOB (YES/NO tokens, position sizin
   `DOWN` signal -> buy NO ("short").
 - **15m market slug** - identifier for the active 15-minute BTC up/down market, resolved by
   `current_btc_15m_slug` / `get_next_btc_15m_markets` in `execution/nautilus_polymarket_integration.py`.
+- **Rollover / N+1 window** - the boundary at `:00/:15/:30/:45` where one 15m window expires and the next opens.
+  A TradingView alert fires at the bar close, so the webhook path targets the freshly-opened **N+1** window
+  (`floor(now/900)*900`, via `tv_market_select.select_target_market`) instead of the expiring one (~$0.99).
+- **Taker / maker** - a **taker** removes liquidity (market order, what the bot sends); a **maker** posts a
+  resting limit order. On 15m/5m crypto only takers pay a fee; makers are free and earn rebates.
+- **Taker fee** - `fee = C × feeRate × p × (1 − p)`, where `C` = shares traded (`stake / p`) and crypto
+  `feeRate = 0.07`; charged in shares on a buy;
+  peaks near $0.50, negligible at the extremes. Gasless/Builder do not waive it. Modeled in the backtest
+  (`matching.simulate_market_buy`, `bot_trades.evaluate_bot_trades`); see backtest-validation.md §4.
 - **Signal weight** - per-processor contribution to the fused score. `SignalFusionEngine` class defaults are
   Spike 40%, Divergence 30%, Sentiment 20%, others 10%, but `bot.py` overrides them at startup (OrderBook 30%,
   TickVelocity 25%, Divergence 18%, Spike 12%, DeribitPCR 10%, Sentiment 5%); adjusted at runtime only by

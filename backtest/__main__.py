@@ -138,11 +138,12 @@ def cmd_report(args: argparse.Namespace) -> int:
             start_ts=start,
             end_ts=end,
             stake_usd=args.stake,
+            fee_rate=args.fee_rate,
             series=args.series,
             source_like=source,
         )
         trades = load_bot_trades(args.bot_trades)
-        bot = evaluate_bot_trades(con, trades)
+        bot = evaluate_bot_trades(con, trades, fee_rate=args.fee_rate)
         conv = conversion_stats(con, start, end, source_like=source, trades=trades)
     finally:
         con.close()
@@ -167,7 +168,10 @@ def cmd_report(args: argparse.Namespace) -> int:
         f"Período : {datetime.fromtimestamp(start, tz=UTC):%Y-%m-%d %H:%M} -> "
         f"{datetime.fromtimestamp(end, tz=UTC):%Y-%m-%d %H:%M} UTC"
     )
-    print(f"Série   : {args.series} | fonte={source} | stake=${args.stake:.2f}")
+    print(
+        f"Série   : {args.series} | fonte={source} | stake=${args.stake:.2f} "
+        f"| fee={args.fee_rate:.2f} (taker, em shares)"
+    )
     print("-" * 70)
     print("[ESTRATÉGIA] sinal -> janela N+1 -> CLOB")
     print(
@@ -235,7 +239,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Polymarket up/down series to replay against",
     )
     p_replay.add_argument("--tolerance", type=float, default=10.0)
-    p_replay.add_argument("--fee-rate", type=float, default=0.0)
+    p_replay.add_argument(
+        "--fee-rate",
+        type=float,
+        default=0.07,
+        help="taker fee rate; 15m/5m crypto = 0.07 (fee = C*r*p*(1-p), in shares). "
+        "Pass 0 for non-fee markets.",
+    )
     p_replay.add_argument(
         "--signal-source",
         help="SQL LIKE filter on signals.source (e.g. tradingview, "
@@ -266,6 +276,13 @@ def main(argv: list[str] | None = None) -> int:
         help="SQL LIKE filter on signals.source (default: live webhook stream)",
     )
     p_report.add_argument("--stake", type=float, default=1.0)
+    p_report.add_argument(
+        "--fee-rate",
+        type=float,
+        default=0.07,
+        help="taker fee rate; 15m/5m crypto = 0.07 (fee = C*r*p*(1-p), in shares). "
+        "Pass 0 for non-fee markets.",
+    )
     p_report.add_argument("--bot-trades", default="tv_dry_run_trades.json")
 
     args = parser.parse_args(argv)

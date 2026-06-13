@@ -1,6 +1,6 @@
 # Project Rules and Guidelines
 
-> Auto-generated from .context/docs on 2026-06-13T11:28:14.678Z
+> Auto-generated from .context/docs on 2026-06-13T16:17:34.171Z
 
 ## rules-CLAUDE
 
@@ -126,6 +126,10 @@ An alternative strategy where TradingView alerts are the only trade trigger. Red
 Flow: TradingView alert → tunnel (cloudflared/ngrok) → `tradingview_webhook_receiver.py` (separate process, stdlib `http.server` on port 8001, validates a shared secret from the JSON body) → `RPUSH btc_trading:tradingview_signals` → `bot.py` consumer thread (`_start_webhook_consumer`, BLPOP) → `_execute_webhook_trade` (risk check + liquidity guard + sim/live gate, bypassing fusion entirely).
 
 Rules: signals older than `TRADINGVIEW_SIGNAL_TTL_SECONDS` (30s) are discarded; max 1 trade per 15-minute market via Redis key `btc_trading:tv_last_traded_market` (survives the 90-min auto-restart); `UP` buys the YES token ("long"), `DOWN` buys the NO token ("short").
+
+Market selection is by **wall clock**, not `current_instrument_index`. The alert fires at the bar close (`:00/:15/:30/:45`) — exactly when a 15m window expires — so `_handle_tradingview_signal` maps `floor(now/900)*900` to the freshly-opened **N+1** window (identical to the backtest's `attach_target_tokens`) and prices it from that market's own book, never the expiring ~$0.99 one. The next market is pre-subscribed (`_ensure_next_subscribed`) and every subscribed instrument's latest quote is cached (`_last_quote_by_instrument`) so the N+1 book is warm at the boundary; with no fresh quote the signal is discarded rather than trading the expiring window. Pure, dependency-free selection logic lives in `tv_market_select.py` (`select_target_market`, `fresh_quote`); the target market's token ids are passed explicitly into `_place_real_order`.
+
+Webhook orders are market orders (**taker**), so on the 15m/5m crypto markets they pay the Polymarket taker fee (`fee = C × feeRate × p × (1 − p)`, where `C` = shares traded (`stake/p`), crypto `feeRate = 0.07`, charged in shares — peaks near $0.50, negligible at the extremes). Gasless and the Builder program do **not** waive it; only maker (resting limit) orders are fee-free. The backtest models the fee (see `.context/docs/backtest-validation.md`).
 
 Dry run: Redis key `btc_trading:tv_dry_run` = "1" (set via `redis_control.py dryrun on|off`). Webhook trades run the FULL live order path in `_place_real_order(dry_run=True)` — the only divergence from live is that `submit_order` is not called (this 100% fidelity is a hard requirement; never add earlier branches). Would-be trades are appended to `tv_dry_run_trades.json`. Dry run takes precedence over sim/live for webhook trades and does not affect the fusion path.
 
