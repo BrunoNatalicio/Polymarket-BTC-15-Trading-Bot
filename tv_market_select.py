@@ -57,3 +57,49 @@ def fresh_quote(
     if now_ts - ts > max_age_s:
         return None
     return (bid, ask)
+
+
+def entry_prob_and_price(
+    signal: str, yes_bid: float, yes_ask: float
+) -> tuple[float, float]:
+    """Book-implied probability AND entry price of the side a TV signal buys.
+
+    UP buys the YES token; DOWN buys the NO token. The live bot only caches the
+    YES instrument's book, but the NO price is its complement: NO_mid = 1 -
+    YES_mid. Returning the BOUGHT side's own price fixes the bug where DOWN
+    trades recorded the YES mid (~0.59) instead of the NO price (~0.41), and
+    yields ``p_side`` — the market's implied probability of the bet — for the
+    conviction gate. Both returned values are equal (mid == fair entry price).
+    """
+    yes_mid = (yes_bid + yes_ask) / 2.0
+    if signal == "UP":
+        return yes_mid, yes_mid
+    return 1.0 - yes_mid, 1.0 - yes_mid
+
+
+def conviction_stake(
+    p_side: float,
+    base_usd: float,
+    p_floor: float,
+    p_full: float,
+    min_frac: float,
+) -> float:
+    """Stake (USD) for a bet whose book-implied probability is ``p_side``.
+
+    Hybrid gate + conviction sizing — the fix for "betting against the book":
+      * ``p_side < p_floor``  -> 0.0       (gate: skip; the book disagrees)
+      * ``p_side >= p_full``  -> base_usd  (full conviction)
+      * in between            -> linear ramp from ``min_frac*base_usd`` up to
+                                 ``base_usd``
+
+    The result never exceeds ``base_usd`` (= MARKET_BUY_USD), so the risk-engine
+    cap and the single-knob bet-size invariant hold (sizing only scales DOWN).
+    ``p_floor == 0.0 and min_frac == 1.0`` reproduces the flat-stake baseline
+    (no gate, no sizing) exactly — which is what keeps the backtest sweep honest.
+    """
+    if p_side < p_floor:
+        return 0.0
+    if p_side >= p_full or p_full <= p_floor:
+        return base_usd
+    frac = min_frac + (1.0 - min_frac) * (p_side - p_floor) / (p_full - p_floor)
+    return base_usd * min(1.0, max(min_frac, frac))

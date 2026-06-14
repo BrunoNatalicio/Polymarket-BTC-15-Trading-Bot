@@ -233,6 +233,56 @@ def test_rollover_market_selection():
     check("missing quote -> None", fresh_quote({}, "N1", now) is None)
 
 
+def test_entry_gate_and_sizing():
+    print("\n9. book-agreement gate + conviction sizing")
+    from tv_market_select import conviction_stake, entry_prob_and_price
+
+    # entry_prob_and_price: UP buys YES (p = yes_mid); DOWN buys NO (p = 1-yes_mid),
+    # which also fixes the bug where DOWN recorded the YES mid.
+    p_up, price_up = entry_prob_and_price("UP", 0.40, 0.42)  # yes_mid = 0.41
+    check("UP p_side = yes_mid", abs(p_up - 0.41) < 1e-9)
+    check("UP price = yes_mid", abs(price_up - 0.41) < 1e-9)
+
+    p_dn, price_dn = entry_prob_and_price("DOWN", 0.40, 0.42)  # NO mid = 0.59
+    check("DOWN p_side = 1 - yes_mid", abs(p_dn - 0.59) < 1e-9)
+    check("DOWN price = NO side (not YES mid)", abs(price_dn - 0.59) < 1e-9)
+
+    # conviction_stake: gate below floor, ramp between, saturate at base.
+    base, floor, full, frac = 3.0, 0.42, 0.55, 0.5
+    check(
+        "below floor -> 0 (gate)",
+        conviction_stake(0.41, base, floor, full, frac) == 0.0,
+    )
+    check(
+        "at floor -> min fraction",
+        abs(conviction_stake(0.42, base, floor, full, frac) - 1.5) < 1e-9,
+    )
+    check(
+        "at/above full -> base",
+        abs(conviction_stake(0.55, base, floor, full, frac) - 3.0) < 1e-9,
+    )
+    check(
+        "way above full -> base (saturates)",
+        conviction_stake(0.90, base, floor, full, frac) == 3.0,
+    )
+    mid = conviction_stake(0.485, base, floor, full, frac)  # halfway -> 0.75*base
+    check("midpoint ramps between min and base", 1.5 < mid < 3.0)
+    check(
+        "never exceeds base_usd (cap)",
+        conviction_stake(0.99, base, floor, full, frac) <= base,
+    )
+
+    # Baseline reproduction: floor 0 + min_frac 1.0 = flat stake, no gate.
+    check(
+        "baseline floor0/frac1 -> always base",
+        conviction_stake(0.01, base, 0.0, 1.0, 1.0) == base,
+    )
+    check(
+        "baseline keeps the longest underdog",
+        conviction_stake(0.30, base, 0.0, 1.0, 1.0) == base,
+    )
+
+
 def test_redis_roundtrip():
     print("\n5. Redis round-trip")
     client = get_redis_client()
@@ -370,6 +420,7 @@ def main() -> int:
     test_direction_mapping()
     test_extra_fields()
     test_rollover_market_selection()
+    test_entry_gate_and_sizing()
     test_redis_roundtrip()
     test_http_end_to_end()
 

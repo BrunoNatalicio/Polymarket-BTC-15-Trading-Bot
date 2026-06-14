@@ -14,6 +14,7 @@ import pandas as pd
 import backtest.ingest as ingest
 import backtest.matching as matching
 import backtest.settlement as settlement
+from tv_market_select import conviction_stake
 
 SERIES = {
     "15m": ("btc-updown-15m-", 900),
@@ -30,6 +31,7 @@ class ReplayReport:
     unfilled_no_data: int = 0
     unfilled_no_market: int = 0
     unfilled_no_liquidity: int = 0
+    unfilled_min_book_prob: int = 0
     unsettled: int = 0
 
     @property
@@ -45,13 +47,15 @@ class ReplayReport:
             "signals_total": len(self.trades)
             + self.unfilled_no_data
             + self.unfilled_no_market
-            + self.unfilled_no_liquidity,
+            + self.unfilled_no_liquidity
+            + self.unfilled_min_book_prob,
             "fills": len(self.trades),
             "settled": len(settled),
             "unsettled": self.unsettled,
             "unfilled_no_data": self.unfilled_no_data,
             "unfilled_no_market": self.unfilled_no_market,
             "unfilled_no_liquidity": self.unfilled_no_liquidity,
+            "unfilled_min_book_prob": self.unfilled_min_book_prob,
             "wins": wins,
             "win_rate": (wins / len(settled)) if settled else None,
             "total_pnl": pnl,
@@ -68,6 +72,29 @@ class ReplayReport:
         return curve
 
 
+def _price_m(value: Any) -> float | None:
+    """A nullable integer-thousandths field -> price in [0,1], or None."""
+    if value is None or not pd.notna(value):
+        return None
+    return float(value) / 1000.0
+
+
+def _bought_side_prob(row: dict[str, Any], asks: list[tuple[float, float]]) -> float:
+    """Implied probability of the bought token from its own book at entry.
+
+    Prefers the snapshot mid (best_bid_m+best_ask_m)/2000 — matching the live
+    bot's mid-based ``p_side`` — and falls back to the top ask when the bid is
+    missing (or the top ask alone when meta is absent).
+    """
+    bid = _price_m(row.get("best_bid_m"))
+    ask = _price_m(row.get("best_ask_m"))
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2.0
+    if ask is not None:
+        return ask
+    return asks[0][0] if asks else 0.0
+
+
 def run_replay(
     con: sqlite3.Connection,
     start_ts: float,
@@ -78,7 +105,18 @@ def run_replay(
     fill_policy: str = "partial",
     series: str = "15m",
     source_like: str | None = None,
+    min_entry_prob: float = 0.0,
+    size_full_prob: float = 1.0,
+    size_min_frac: float = 1.0,
 ) -> ReplayReport:
+    """Replay signals against recorded books.
+
+    ``min_entry_prob`` / ``size_full_prob`` / ``size_min_frac`` drive the hybrid
+    book-agreement gate + conviction sizing (shared with the live bot via
+    ``tv_market_select.conviction_stake``). Their defaults (floor 0, min_frac 1)
+    reproduce the flat-stake baseline exactly, so a sweep that includes the
+    defaults can never report a config worse than baseline.
+    """
     slug_prefix, window_seconds = SERIES[series]
     report = ReplayReport(start_ts=start_ts, end_ts=end_ts, stake_usd=stake_usd)
     markets = ingest.load_markets(con)
@@ -115,7 +153,18 @@ def run_replay(
         )
         for row in matched.to_dict("records"):
             asks = books.get(int(row["snapshot_id"]), {}).get("asks", [])
-            fill = matching.simulate_market_buy(asks, stake_usd, fee_rate=fee_rate)
+            # p_side = bought-token implied prob (its own book mid). The bought
+            # token is YES for UP / NO for DOWN (attach_target_tokens), so this
+            # is the real probability of the bet — same quantity the live gate
+            # uses. Hybrid gate + sizing decides the stake before the fill.
+            p_side = _bought_side_prob(row, asks)
+            stake = conviction_stake(
+                p_side, stake_usd, min_entry_prob, size_full_prob, size_min_frac
+            )
+            if stake <= 0:
+                report.unfilled_min_book_prob += 1
+                continue
+            fill = matching.simulate_market_buy(asks, stake, fee_rate=fee_rate)
             if fill.filled_tokens <= 0:
                 # snapshot existed but its ask book was empty — a real
                 # liquidity condition (e.g. nobody sells the near-certain

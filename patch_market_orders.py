@@ -49,6 +49,23 @@ def apply_market_order_patch():
         _DEFAULT_USD_AMOUNT = float(os.getenv("MARKET_BUY_USD", "1.0"))
         logger.info(f"Market BUY USD amount configured to: ${_DEFAULT_USD_AMOUNT:.2f}")
 
+        def _order_usd(order) -> float:
+            """Per-order intended USD from order.tags (`tv_usd=<n>`), else env.
+
+            The strategy tags each BUY with its conviction-scaled stake so live
+            spends exactly what dry run records (dry-run==live fidelity). The env
+            knob is only the fallback when no tag is present.
+            """
+            for tag in getattr(order, "tags", None) or []:
+                if isinstance(tag, str) and tag.startswith("tv_usd="):
+                    try:
+                        value = float(tag.split("=", 1)[1])
+                    except ValueError:
+                        break
+                    if value > 0:
+                        return value
+            return float(os.getenv("MARKET_BUY_USD", str(_DEFAULT_USD_AMOUNT)))
+
         async def _patched_submit_market_order(self, command, instrument):
             """
             Patched market order handler.
@@ -59,10 +76,8 @@ def apply_market_order_patch():
             order = command.order
 
             if order.side == OrderSide.BUY:
-                # Read amount each call so live env changes take effect
-                usd_amount = float(
-                    os.getenv("MARKET_BUY_USD", str(_DEFAULT_USD_AMOUNT))
-                )
+                # Per-order intended USD (conviction-scaled tag) or env fallback.
+                usd_amount = _order_usd(order)
 
                 self._log.info(
                     f"[PATCH] BUY market order → using ${usd_amount:.2f} USD "

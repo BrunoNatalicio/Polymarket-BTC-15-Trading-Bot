@@ -83,7 +83,12 @@ from execution.risk_engine import get_risk_engine
 from feedback.learning_engine import get_learning_engine
 from monitoring.grafana_exporter import get_grafana_exporter
 from monitoring.performance_tracker import get_performance_tracker
-from tv_market_select import fresh_quote, select_target_market
+from tv_market_select import (
+    conviction_stake,
+    entry_prob_and_price,
+    fresh_quote,
+    select_target_market,
+)
 
 load_dotenv()
 from patch_market_orders import apply_market_order_patch
@@ -276,6 +281,14 @@ class IntegratedBTCStrategy(Strategy):
         self.active_strategy = "fusion"
         self._tv_confidence = float(os.getenv("TRADINGVIEW_SIGNAL_CONFIDENCE", "0.75"))
         self._tv_signal_ttl = float(os.getenv("TRADINGVIEW_SIGNAL_TTL_SECONDS", "30"))
+        # Hybrid book-agreement gate + conviction sizing (shared math with the
+        # backtest via tv_market_select.conviction_stake). Defaults are the
+        # PnL-maximising config from `backtest tune` (floor 0.42, sizing neutral);
+        # tune again and re-set these as data grows. Floor 0 + min_frac 1 = old
+        # flat-stake behaviour.
+        self._tv_min_book_prob = float(os.getenv("TV_MIN_BOOK_PROB", "0.42"))
+        self._tv_size_full_prob = float(os.getenv("TV_SIZE_FULL_PROB", "0.55"))
+        self._tv_size_min_frac = float(os.getenv("TV_SIZE_MIN_FRAC", "1.0"))
 
         if test_mode:
             logger.info("=" * 80)
@@ -1078,7 +1091,27 @@ class IntegratedBTCStrategy(Strategy):
             )
             return
         bid_d, ask_d = quote
-        mid_price = (bid_d + ask_d) / 2
+
+        # Hybrid book-agreement gate + conviction sizing. p_side is the BOUGHT
+        # side's own implied probability (UP=YES mid, DOWN=1-YES mid) and
+        # entry_price is that side's price — which also fixes the bug where DOWN
+        # recorded the YES mid (~0.59) instead of the NO price (~0.41). The point:
+        # stop entering when the book already prices our side as a deep underdog
+        # (every historical loss sat below the floor). stake==0 => gate skip.
+        p_side, entry_price = entry_prob_and_price(signal, float(bid_d), float(ask_d))
+        stake = conviction_stake(
+            p_side,
+            float(POSITION_SIZE_USD),
+            self._tv_min_book_prob,
+            self._tv_size_full_prob,
+            self._tv_size_min_frac,
+        )
+        if stake <= 0.0:
+            logger.warning(
+                f"TV signal {signal} DISCARDED — book disagrees "
+                f"(p_side={p_side:.3f} < floor {self._tv_min_book_prob:.2f})"
+            )
+            return
 
         # One trade per 15-min market. Dedup key lives in Redis so the
         # 90-min auto-restart can't cause a double trade in the same market.
@@ -1103,32 +1136,44 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         logger.info(
             f" TRADINGVIEW SIGNAL TRADE: {signal} | age {age:.1f}s | "
-            f"price ${float(mid_price):.4f} | market {target_market['slug']}"
+            f"p_side {p_side:.3f} | price ${entry_price:.4f} | stake ${stake:.2f} | "
+            f"market {target_market['slug']}"
         )
         logger.info("=" * 80)
 
         self._execute_webhook_trade_sync(
-            signal, float(mid_price), target_market, (bid_d, ask_d)
+            signal, entry_price, stake, target_market, (bid_d, ask_d)
         )
 
     def _execute_webhook_trade_sync(
-        self, signal: str, current_price: float, target_market: dict, bid_ask: tuple
+        self,
+        signal: str,
+        current_price: float,
+        stake_usd: float,
+        target_market: dict,
+        bid_ask: tuple,
     ):
         """Synchronous wrapper (consumer thread owns its own event loop)."""
         price_decimal = Decimal(str(current_price))
+        stake_decimal = Decimal(str(stake_usd))
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(
                 self._execute_webhook_trade(
-                    signal, price_decimal, target_market, bid_ask
+                    signal, price_decimal, stake_decimal, target_market, bid_ask
                 )
             )
         finally:
             loop.close()
 
     async def _execute_webhook_trade(
-        self, signal: str, current_price: Decimal, target_market: dict, bid_ask: tuple
+        self,
+        signal: str,
+        current_price: Decimal,
+        stake_usd: Decimal,
+        target_market: dict,
+        bid_ask: tuple,
     ):
         """
         Execute a TradingView signal directly — no fusion, no trend filter.
@@ -1175,7 +1220,7 @@ class IntegratedBTCStrategy(Strategy):
         )
 
         is_valid, error = self.risk_engine.validate_new_position(
-            size=POSITION_SIZE_USD,
+            size=stake_usd,
             direction=direction,
             current_price=current_price,
         )
@@ -1184,7 +1229,8 @@ class IntegratedBTCStrategy(Strategy):
             return
 
         logger.info(
-            f"Position size: ${float(POSITION_SIZE_USD):.2f} (MARKET_BUY_USD) | "
+            f"Position size: ${float(stake_usd):.2f} "
+            f"(conviction-scaled, cap MARKET_BUY_USD ${float(POSITION_SIZE_USD):.2f}) | "
             f"Direction: {direction.upper()}"
         )
 
@@ -1210,7 +1256,7 @@ class IntegratedBTCStrategy(Strategy):
             # Dry run takes precedence over sim/live: rehearse the live path
             await self._place_real_order(
                 tv_signal,
-                POSITION_SIZE_USD,
+                stake_usd,
                 current_price,
                 direction,
                 dry_run=True,
@@ -1220,12 +1266,12 @@ class IntegratedBTCStrategy(Strategy):
             )
         elif is_simulation:
             await self._record_paper_trade(
-                tv_signal, POSITION_SIZE_USD, current_price, direction
+                tv_signal, stake_usd, current_price, direction
             )
         else:
             await self._place_real_order(
                 tv_signal,
-                POSITION_SIZE_USD,
+                stake_usd,
                 current_price,
                 direction,
                 market_slug=market_slug,
@@ -1631,6 +1677,11 @@ class IntegratedBTCStrategy(Strategy):
             timestamp_ms = int(time.time() * 1000)
             unique_id = f"BTC-15MIN-${max_usd_amount:.0f}-{timestamp_ms}"
 
+            # Carry the intended USD on the order so the market-order patch spends
+            # exactly this (conviction-scaled) amount, not the static env knob —
+            # otherwise live would ignore sizing while dry run records it, breaking
+            # the dry-run==live invariant. Fusion passes MARKET_BUY_USD so its tag
+            # equals the env default (unchanged behaviour).
             order = self.order_factory.market(
                 instrument_id=trade_instrument_id,
                 order_side=side,
@@ -1638,6 +1689,7 @@ class IntegratedBTCStrategy(Strategy):
                 client_order_id=ClientOrderId(unique_id),
                 quote_quantity=False,
                 time_in_force=TimeInForce.IOC,
+                tags=[f"tv_usd={max_usd_amount:.4f}"],
             )
 
             # SINGLE DIVERGENCE POINT between dry run and live: the order was
