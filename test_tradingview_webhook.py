@@ -283,6 +283,121 @@ def test_entry_gate_and_sizing():
     )
 
 
+def test_calibrated_confirmation():
+    print("\n10. calibrated confirmation layer (posterior + fee breakeven)")
+    from tv_market_select import (
+        confirm_probability,
+        confirm_signal,
+        fee_breakeven_prob,
+    )
+
+    # beta_book == 0 -> flat prior: P_win == base_rate for any book.
+    check(
+        "beta=0 -> P_win == base_rate",
+        abs(confirm_probability(0.30, 0.64, 0.0) - 0.64) < 1e-9
+        and abs(confirm_probability(0.90, 0.64, 0.0) - 0.64) < 1e-9,
+    )
+
+    # Monotonic increasing in p_side when the book carries positive weight.
+    lo = confirm_probability(0.40, 0.5, 10.0, p_bar=0.5)
+    hi = confirm_probability(0.60, 0.5, 10.0, p_bar=0.5)
+    check("monotonic increasing in p_side", lo < 0.5 < hi)
+
+    # Clamping: extreme base_rate stays finite (no log(0) / overflow).
+    check(
+        "base_rate ~1 clamped finite",
+        0.5 < confirm_probability(0.5, 1.0, 5.0) < 1.0,
+    )
+    check(
+        "base_rate ~0 clamped finite",
+        0.0 < confirm_probability(0.5, 0.0, 5.0) < 0.5,
+    )
+
+    # fee_breakeven_prob: zero fee -> pay-the-probability fair value (== price);
+    # positive fee raises the bar above the price.
+    check(
+        "zero fee -> breakeven == price",
+        abs(fee_breakeven_prob(0.5, 0.0) - 0.5) < 1e-9,
+    )
+    check("taker fee raises breakeven above price", fee_breakeven_prob(0.5, 0.07) > 0.5)
+
+    # Generalisation proof (posterior threshold alone): base_rate=0.5, p_bar=floor,
+    # large beta, tau=0.5 makes "P_win >= tau" equivalent to "p_side >= floor"
+    # EXACTLY — so a backtest sweep including this config can't do worse than the
+    # current hard gate. (confirm_signal adds the fee veto on top; tested below.)
+    floor = 0.42
+    mismatches = 0
+    for i in range(101):
+        p_side = i / 100.0
+        old_gate = p_side >= floor
+        new_gate = confirm_probability(p_side, 0.5, 1e3, p_bar=floor) >= 0.5
+        if old_gate != new_gate:
+            mismatches += 1
+    check("posterior threshold reproduces hard floor gate exactly", mismatches == 0)
+
+    # Fee breakeven vetoes a thin POSITIVE edge: at price 0.5 the fair value is
+    # 0.5, but the taker fee lifts breakeven to ~0.518. A posterior of 0.51 beats
+    # fair value (would trade fee-free) yet loses money after the fee -> vetoed.
+    p_win_thin = confirm_probability(0.5, 0.51, 5.0, p_bar=0.5)  # == 0.51
+    be = fee_breakeven_prob(0.5, 0.07)  # ~0.518
+    check("thin edge sits between fair value and fee breakeven", 0.5 < p_win_thin < be)
+    check(
+        "fee-free this edge would trade",
+        confirm_signal(
+            0.5, price=0.5, base_rate=0.51, beta_book=5.0, tau=0.5, fee_rate=0.0
+        ),
+    )
+    check(
+        "taker fee vetoes the same edge",
+        not confirm_signal(
+            0.5, price=0.5, base_rate=0.51, beta_book=5.0, tau=0.5, fee_rate=0.07
+        ),
+    )
+
+
+def test_z_momentum():
+    print("\n11. z_momentum (vol-normalized spot momentum, Phase 2)")
+    from tv_market_select import confirm_probability, z_momentum
+
+    # Too little history -> 0.0 (neutral, never fabricates a signal).
+    check("insufficient history -> 0.0", z_momentum([100.0, 101.0, 102.0]) == 0.0)
+
+    # Flat series -> zero volatility -> 0.0 (no divide-by-zero).
+    check("flat series -> 0.0", z_momentum([100.0] * 30) == 0.0)
+
+    # Steady uptrend -> positive z; steady downtrend -> negative z.
+    up = [100.0 * (1.005**i) for i in range(30)]
+    down = [100.0 * (0.995**i) for i in range(30)]
+    check("uptrend -> positive z", z_momentum(up) > 0.0)
+    check("downtrend -> negative z", z_momentum(down) < 0.0)
+
+    # Holding history fixed, a recent up-move scores higher than a recent
+    # down-move (z is signed by the last k returns' direction).
+    hist = [100.0 * (1.002**i) for i in range(27)]
+    recent_up = hist + [hist[-1] * 1.01, hist[-1] * 1.0201, hist[-1] * 1.0303]
+    recent_dn = hist + [hist[-1] * 0.99, hist[-1] * 0.9801, hist[-1] * 0.9703]
+    check(
+        "recent up-move scores above recent down-move",
+        z_momentum(recent_up) > z_momentum(recent_dn),
+    )
+
+    # beta_mom == 0 ignores z_mom entirely (Phase-1 behavior preserved).
+    check(
+        "beta_mom=0 ignores z_mom",
+        abs(
+            confirm_probability(0.5, 0.6, 5.0, 0.5, 0.0, 99.0)
+            - confirm_probability(0.5, 0.6, 5.0, 0.5)
+        )
+        < 1e-12,
+    )
+
+    # Positive z_mom with positive beta_mom lifts the posterior; negative lowers it.
+    p0 = confirm_probability(0.5, 0.5, 0.0, 0.5, beta_mom=0.5, z_mom=0.0)
+    p_up = confirm_probability(0.5, 0.5, 0.0, 0.5, beta_mom=0.5, z_mom=2.0)
+    p_dn = confirm_probability(0.5, 0.5, 0.0, 0.5, beta_mom=0.5, z_mom=-2.0)
+    check("positive z_mom lifts posterior", p_dn < p0 < p_up)
+
+
 def test_redis_roundtrip():
     print("\n5. Redis round-trip")
     client = get_redis_client()
@@ -421,6 +536,8 @@ def main() -> int:
     test_extra_fields()
     test_rollover_market_selection()
     test_entry_gate_and_sizing()
+    test_calibrated_confirmation()
+    test_z_momentum()
     test_redis_roundtrip()
     test_http_end_to_end()
 

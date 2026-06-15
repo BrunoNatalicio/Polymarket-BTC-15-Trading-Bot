@@ -1,6 +1,6 @@
 # Project Rules and Guidelines
 
-> Auto-generated from .context/docs on 2026-06-14T15:40:12.487Z
+> Auto-generated from .context/docs on 2026-06-15T21:21:30.365Z
 
 ## rules-CLAUDE
 
@@ -239,6 +239,7 @@ Welcome to the repository knowledge base. Start with the project overview, then 
 - [Tooling & Productivity Guide](./tooling.md)
 - [TradingView Strategy Runbook](./tradingview-runbook.md)
 - [Backtest Validation & Reporting](./backtest-validation.md)
+- [TradingView Signal Confirmation Layer](./tv-confirmation-layer.md)
 
 ## Repository Snapshot
 - Directories: `core/`, `data_sources/`, `execution/`, `feedback/`, `grafana/`, `monitoring/`, `workflow/`

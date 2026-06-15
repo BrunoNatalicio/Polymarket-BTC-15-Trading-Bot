@@ -127,13 +127,184 @@ def cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bar_seconds(args: argparse.Namespace) -> int:
+    """Bar length in seconds for the selected series (15m=900, 5m=300)."""
+    return 300 if args.series == "5m" else 900
+
+
+def _side_stats(report: Any, side: str) -> tuple[int, int, float]:
+    """(settled, wins, pnl) restricted to one direction of a ReplayReport."""
+    trades = [t for t in report.settled if str(t["direction"]) == side]
+    wins = sum(1 for t in trades if t["won"])
+    pnl = sum(t["pnl"] for t in trades)
+    return len(trades), wins, pnl
+
+
+MIN_LIVE_SAMPLE = 200  # do not act on the model live until >= this many settled
+
+
+def cmd_tune_confirm(args: argparse.Namespace, side: str) -> int:
+    """Sweep the calibrated confirmation gate for one side and pick argmax(PnL).
+
+    The prior ``base_rate`` is ESTIMATED from data (unconditional win-rate of the
+    side, no gate) — not swept. Only ``beta_book``/``beta_mom``/``tau`` are tuned.
+    ``--closes-csv`` enables the Phase-2 spot-momentum feature ``z_mom``; without
+    it the sweep is book-only (Phase 1) and ``beta_mom`` is held at 0. The current
+    live gate (``--current-floor``) is the comparison baseline. ``p_bar`` is fixed
+    at 0.5 (book coin-flip -> posterior == prior).
+
+    Go-live guard: when the side's settled sample is below ``MIN_LIVE_SAMPLE`` the
+    report still prints, but the suggested env defaults are SUPPRESSED — any
+    argmax over a tiny sample is noise, not an edge.
+    """
+    from backtest.engine import run_replay
+    from backtest.ingest import (
+        load_bar_closes_csv,
+        load_closes_from_signals,
+        z_mom_by_window,
+    )
+
+    start = _parse_when(args.start) if args.start else 0.0
+    end = _parse_when(args.end) if args.end else time.time()
+    bar_s = _bar_seconds(args)
+
+    con = db.connect()
+    try:
+        zmom = None
+        if args.closes_from_signals:
+            zmom = z_mom_by_window(
+                load_closes_from_signals(con, args.signal_source, start, end, bar_s)
+            )
+        elif args.closes_csv:
+            zmom = z_mom_by_window(load_bar_closes_csv(args.closes_csv, bar_s))
+        # Prior: unconditional win-rate of this side (no gate, flat stake).
+        base = run_replay(
+            con,
+            start_ts=start,
+            end_ts=end,
+            stake_usd=args.stake,
+            fee_rate=args.fee_rate,
+            series=args.series,
+            source_like=args.signal_source,
+        )
+        n_all, w_all, _ = _side_stats(base, side)
+        base_rate = (w_all / n_all) if n_all else 0.5
+
+        # Comparison baseline: the CURRENT live gate (book-prob floor) on this side.
+        cur = run_replay(
+            con,
+            start_ts=start,
+            end_ts=end,
+            stake_usd=args.stake,
+            fee_rate=args.fee_rate,
+            series=args.series,
+            source_like=args.signal_source,
+            min_entry_prob=args.current_floor,
+        )
+        cur_n, cur_w, cur_pnl = _side_stats(cur, side)
+
+        betas = [0.0, 5.0]
+        beta_moms = [0.0, 0.25, 0.5, 1.0] if zmom else [0.0]
+        taus = [0.50, 0.55]
+        results: list[dict[str, Any]] = []
+        for b in betas:
+            for bm in beta_moms:
+                for t in taus:
+                    rep = run_replay(
+                        con,
+                        start_ts=start,
+                        end_ts=end,
+                        stake_usd=args.stake,
+                        fee_rate=args.fee_rate,
+                        series=args.series,
+                        source_like=args.signal_source,
+                        confirm_side=side,
+                        confirm_base_rate=base_rate,
+                        confirm_beta=b,
+                        confirm_tau=t,
+                        confirm_p_bar=0.5,
+                        confirm_beta_mom=bm,
+                        z_mom_by_window=zmom,
+                    )
+                    n, w, pnl = _side_stats(rep, side)
+                    results.append(
+                        {
+                            "beta": b,
+                            "beta_mom": bm,
+                            "tau": t,
+                            "settled": n,
+                            "win_rate": (w / n) if n else 0.0,
+                            "pnl": pnl,
+                            "ev": (pnl / n) if n else 0.0,
+                        }
+                    )
+    finally:
+        con.close()
+
+    best = max(results, key=lambda r: r["pnl"])
+    results.sort(key=lambda r: r["pnl"], reverse=True)
+
+    line = "=" * 80
+    feat = "book+z_mom (Fase 2)" if zmom else "book-only (Fase 1)"
+    print(line)
+    print(f"CONFIRMATION TUNE [{side}] — feature: {feat} — critério: PnL total")
+    print(line)
+    print(
+        f"prior base_rate (win-rate {side} sem gate) = {base_rate:.3f}  "
+        f"({w_all}/{n_all})   |   p_bar fixo = 0.50"
+    )
+    print(
+        f"baseline (gate atual floor {args.current_floor:.2f}): "
+        f"PnL ${cur_pnl:+.2f}  win {cur_w}/{cur_n}"
+    )
+    print("-" * 80)
+    print(
+        f"{'beta':>6} {'b_mom':>6} {'tau':>6} {'settled':>8} {'win%':>6} "
+        f"{'PnL':>9} {'EV/trade':>9}"
+    )
+    for r in results:
+        tag = "  <- BEST PnL" if r is best else ""
+        print(
+            f"{r['beta']:>6.1f} {r['beta_mom']:>6.2f} {r['tau']:>6.2f} "
+            f"{r['settled']:>8} {r['win_rate'] * 100:>5.0f}% {r['pnl']:>+9.2f} "
+            f"{r['ev']:>+9.3f}{tag}"
+        )
+    print("-" * 80)
+    delta = best["pnl"] - cur_pnl
+    verdict = "MELHORA" if delta > 1e-9 else "SEM GANHO vs gate atual"
+    print(
+        f"best PnL ${best['pnl']:+.2f} vs gate atual ${cur_pnl:+.2f} | "
+        f"delta ${delta:+.2f}  -> {verdict}"
+    )
+    if n_all < MIN_LIVE_SAMPLE:
+        print(
+            f"AMOSTRA INSUFICIENTE: n={n_all} < {MIN_LIVE_SAMPLE} settled — "
+            f"NÃO acionar ao vivo (qualquer argmax aqui é ruído). "
+            f"Defaults suprimidos até n>={MIN_LIVE_SAMPLE}."
+        )
+    else:
+        print(
+            f"defaults sugeridos -> TV_CONFIRM_SIDE={side} "
+            f"TV_CONFIRM_BASE_RATE={base_rate:.3f} TV_CONFIRM_BETA={best['beta']} "
+            f"TV_CONFIRM_BETA_MOM={best['beta_mom']} TV_CONFIRM_TAU={best['tau']} "
+            f"TV_CONFIRM_P_BAR=0.5"
+        )
+    print(line)
+    return 0
+
+
 def cmd_tune(args: argparse.Namespace) -> int:
     """Sweep gate+sizing configs and pick argmax(total PnL).
 
     The baseline (floor 0, frac 1.0 = flat stake, no gate) is always in the
     grid, so the recommended config's PnL is >= baseline by construction — the
     "no downgrade" guarantee is mechanical, not a promise.
+
+    With ``--confirm-side`` set, delegates to the calibrated-confirmation sweep.
     """
+    if getattr(args, "confirm_side", None):
+        return cmd_tune_confirm(args, args.confirm_side)
+
     from backtest.engine import run_replay
 
     start = _parse_when(args.start) if args.start else 0.0
@@ -419,6 +590,30 @@ def main(argv: list[str] | None = None) -> int:
     p_tune.add_argument("--signal-source", default="tradingview")
     p_tune.add_argument("--stake", type=float, default=1.0)
     p_tune.add_argument("--fee-rate", type=float, default=0.07)
+    p_tune.add_argument(
+        "--confirm-side",
+        choices=["UP", "DOWN"],
+        help="sweep the calibrated confirmation gate for this side only "
+        "(prior estimated from data); omit for the floor/sizing sweep",
+    )
+    p_tune.add_argument(
+        "--current-floor",
+        type=float,
+        default=0.42,
+        help="book-prob floor of the CURRENT live gate, used as the "
+        "comparison baseline for the confirmation sweep (default 0.42)",
+    )
+    p_tune.add_argument(
+        "--closes-csv",
+        help="OHLC CSV (time+close) feeding the Phase-2 z_mom feature; "
+        "omit for a book-only (Phase 1) confirmation sweep",
+    )
+    p_tune.add_argument(
+        "--closes-from-signals",
+        action="store_true",
+        help="feed z_mom from the signals' own raw_json.preco_fechamento "
+        "(live-aligned close source); takes precedence over --closes-csv",
+    )
 
     args = parser.parse_args(argv)
     handlers = {

@@ -411,6 +411,66 @@ def test_bot_trades():
     con.close()
 
 
+def test_z_mom_ingest():
+    print("\n9. z_mom ingest (closes from signals + CSV, Phase 2)")
+    import json
+    import tempfile
+
+    import backtest.db as db
+    from backtest.ingest import (
+        load_bar_closes_csv,
+        load_closes_from_signals,
+        z_mom_by_window,
+    )
+    from tv_market_select import z_momentum
+
+    con = db.connect(":memory:")
+    con.executescript(db.SCHEMA)
+
+    # 30 signals at consecutive 15m boundaries, each carrying preco_fechamento.
+    w0 = 1_000_000_800  # multiple of 900
+    closes = [100.0 * (1.001**i) for i in range(30)]
+    for i, c in enumerate(closes):
+        ts = w0 + i * 900 + 0.5  # fires just after the boundary
+        db.insert_signal(
+            con,
+            f"sig-{i}",
+            float(ts),
+            "UP",
+            raw_json=json.dumps({"preco_fechamento": str(c)}),
+        )
+
+    pairs = load_closes_from_signals(con, "tradingview", 0.0, 2_000_000_000.0)
+    check("one close per window, sorted", len(pairs) == 30 and pairs[0][0] == w0)
+    check("close ts == window_start (boundary)", pairs[5][0] == w0 + 5 * 900)
+    check("close value parsed from raw_json", abs(pairs[0][1] - closes[0]) < 1e-9)
+
+    zmap = z_mom_by_window(pairs)
+    # No-lookahead: the entry for window W uses only closes up to and incl. W.
+    w_last = pairs[-1][0]
+    expected = z_momentum([c for _, c in pairs])
+    check(
+        "z_mom at last window matches full series", abs(zmap[w_last] - expected) < 1e-9
+    )
+    check("early window (too little history) -> 0.0", zmap[pairs[3][0]] == 0.0)
+    check("uptrend -> positive z at last window", zmap[w_last] > 0.0)
+    con.close()
+
+    # CSV loader: bar-close ts = time + bar_seconds.
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".csv", delete=False, newline=""
+    ) as fh:
+        fh.write("time,open,close\n1000000800,100,101\n1000001700,101,102\n")
+        csv_path = fh.name
+    csv_pairs = load_bar_closes_csv(csv_path, bar_seconds=900)
+    os.unlink(csv_path)
+    check(
+        "CSV close ts = time+900, value=close",
+        csv_pairs[0] == (1_000_001_700, 101.0)
+        and csv_pairs[1] == (1_000_002_600, 102.0),
+    )
+
+
 def main() -> int:
     print("=" * 60)
     print("BACKTEST REPLAY ENGINE - TESTS")
@@ -424,6 +484,7 @@ def main() -> int:
     test_csv_import()
     test_clob_outcome()
     test_bot_trades()
+    test_z_mom_ingest()
 
     print("\n" + "=" * 60)
     print(f"RESULT: {PASSED} passed, {FAILED} failed")

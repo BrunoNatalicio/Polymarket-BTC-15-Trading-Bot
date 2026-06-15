@@ -14,7 +14,7 @@ import pandas as pd
 import backtest.ingest as ingest
 import backtest.matching as matching
 import backtest.settlement as settlement
-from tv_market_select import conviction_stake
+from tv_market_select import confirm_signal, conviction_stake
 
 SERIES = {
     "15m": ("btc-updown-15m-", 900),
@@ -108,6 +108,13 @@ def run_replay(
     min_entry_prob: float = 0.0,
     size_full_prob: float = 1.0,
     size_min_frac: float = 1.0,
+    confirm_side: str | None = None,
+    confirm_base_rate: float = 0.5,
+    confirm_beta: float = 0.0,
+    confirm_tau: float = 0.5,
+    confirm_p_bar: float = 0.5,
+    confirm_beta_mom: float = 0.0,
+    z_mom_by_window: dict[int, float] | None = None,
 ) -> ReplayReport:
     """Replay signals against recorded books.
 
@@ -116,6 +123,13 @@ def run_replay(
     ``tv_market_select.conviction_stake``). Their defaults (floor 0, min_frac 1)
     reproduce the flat-stake baseline exactly, so a sweep that includes the
     defaults can never report a config worse than baseline.
+
+    ``confirm_side`` (e.g. ``"UP"``) swaps the book-agreement floor for the
+    calibrated confirmation gate (``tv_market_select.confirm_signal``) on that
+    side ONLY — the other side keeps ``conviction_stake`` untouched. Default
+    ``None`` disables it entirely, so existing callers/sweeps are byte-for-byte
+    unchanged. Applied to UP first; DOWN stays on the floor until its execution
+    bug is fixed (no statistical filter repairs an execution failure).
     """
     slug_prefix, window_seconds = SERIES[series]
     report = ReplayReport(start_ts=start_ts, end_ts=end_ts, stake_usd=stake_usd)
@@ -158,12 +172,38 @@ def run_replay(
             # is the real probability of the bet — same quantity the live gate
             # uses. Hybrid gate + sizing decides the stake before the fill.
             p_side = _bought_side_prob(row, asks)
-            stake = conviction_stake(
-                p_side, stake_usd, min_entry_prob, size_full_prob, size_min_frac
-            )
-            if stake <= 0:
-                report.unfilled_min_book_prob += 1
-                continue
+            direction = str(row["direction"])
+            # Calibrated confirmation gate replaces the book-agreement floor for
+            # ``confirm_side`` only (default None -> conviction_stake baseline
+            # unchanged). Sizing is held flat on a confirmed trade — sizing is a
+            # separate knob and conflating the two muddies the A/B vs baseline.
+            if confirm_side is not None and direction == confirm_side:
+                z = (
+                    z_mom_by_window.get(int(row["window_start"]), 0.0)
+                    if z_mom_by_window
+                    else 0.0
+                )
+                if not confirm_signal(
+                    p_side,
+                    p_side,
+                    confirm_base_rate,
+                    confirm_beta,
+                    confirm_tau,
+                    fee_rate,
+                    confirm_p_bar,
+                    confirm_beta_mom,
+                    z,
+                ):
+                    report.unfilled_min_book_prob += 1
+                    continue
+                stake = stake_usd
+            else:
+                stake = conviction_stake(
+                    p_side, stake_usd, min_entry_prob, size_full_prob, size_min_frac
+                )
+                if stake <= 0:
+                    report.unfilled_min_book_prob += 1
+                    continue
             fill = matching.simulate_market_buy(asks, stake, fee_rate=fee_rate)
             if fill.filled_tokens <= 0:
                 # snapshot existed but its ask book was empty — a real
@@ -176,7 +216,6 @@ def run_replay(
                 continue
 
             outcome = row["outcome"] if isinstance(row["outcome"], str) else None
-            direction = str(row["direction"])
             trade: dict[str, Any] = {
                 "signal_id": row["signal_id"],
                 "signal_ts": row["ts"],

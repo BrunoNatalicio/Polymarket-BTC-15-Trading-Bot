@@ -81,6 +81,84 @@ def attach_target_tokens(
     return out.drop(columns=["yes_token_id", "no_token_id"])
 
 
+def load_bar_closes_csv(
+    csv_path: str, bar_seconds: int = WINDOW_SECONDS
+) -> list[tuple[int, float]]:
+    """Load ``(close_ts, close)`` pairs from a TradingView/Coinbase OHLC export.
+
+    ``time`` in the export is the bar OPEN unix ts, so the bar CLOSE — the moment
+    a signal at that boundary fires — is ``time + bar_seconds``. Returns pairs
+    sorted ascending by close ts. Used to feed ``z_momentum`` for the Phase-2
+    confirmation feature (the dense spot-close series the live book lacks).
+    """
+    df = pd.read_csv(csv_path)
+    time_col = next((c for c in ("time", "Time", "timestamp") if c in df.columns), None)
+    if time_col is None or "close" not in df.columns:
+        raise ValueError("CSV needs a 'time' and a 'close' column (OHLC export)")
+    if pd.api.types.is_numeric_dtype(df[time_col]):
+        open_ts = df[time_col].astype("int64")
+    else:
+        open_ts = (
+            pd.to_datetime(df[time_col], utc=True).astype("int64") // 1_000_000_000
+        )
+    pairs = [
+        (int(o) + bar_seconds, float(c))
+        for o, c in zip(open_ts, df["close"], strict=True)
+        if pd.notna(c)
+    ]
+    pairs.sort(key=lambda p: p[0])
+    return pairs
+
+
+def load_closes_from_signals(
+    con: sqlite3.Connection,
+    source_like: str | None,
+    start_ts: float,
+    end_ts: float,
+    window_seconds: int = WINDOW_SECONDS,
+) -> list[tuple[int, float]]:
+    """Build ``(bar_close_ts, close)`` from the signals' own ``preco_fechamento``.
+
+    The live webhook carries the closing price in every alert; the signal fires
+    at the bar boundary, so its bar-close ts == ``floor(ts/window)*window`` ==
+    the engine's ``window_start``. Dedups by window (last close wins). This is
+    the LIVE-aligned close source for ``z_momentum`` — the Coinbase CSV only
+    covers the historical chart-import period, which has no recorded books.
+    """
+    import json
+
+    query = "SELECT ts, raw_json FROM signals WHERE ts >= ? AND ts < ?"
+    params: list[Any] = [start_ts, end_ts]
+    if source_like:
+        query += " AND source LIKE ?"
+        params.append(source_like)
+    by_window: dict[int, float] = {}
+    for ts, raw in con.execute(query, params):
+        if not raw:
+            continue
+        try:
+            close = float(json.loads(raw).get("preco_fechamento"))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        by_window[(int(ts) // window_seconds) * window_seconds] = close
+    return sorted(by_window.items())
+
+
+def z_mom_by_window(
+    closes: list[tuple[int, float]], k: int = 3, n: int = 20
+) -> dict[int, float]:
+    """Map each bar-close ts -> ``z_momentum`` of all closes up to AND INCLUDING it.
+
+    No lookahead: the entry for close ts ``W`` uses only closes with ts <= ``W``,
+    which is exactly the information available when a signal fires at ``W`` (the
+    signal's ``window_start`` equals the just-closed bar's close ts).
+    """
+    from tv_market_select import z_momentum
+
+    values = [c[1] for c in closes]
+    return {ts: z_momentum(values[: i + 1], k, n) for i, (ts, _) in enumerate(closes)}
+
+
 def load_snapshot_meta(
     con: sqlite3.Connection,
     token_ids: list[str],

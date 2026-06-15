@@ -10,6 +10,8 @@ signal — `floor(ts/900)*900` — identical to the backtest's
 `attach_target_tokens`, which lands on the fresh "N+1" window.
 """
 
+import math
+from collections.abc import Sequence
 from typing import Any
 
 WINDOW_SECONDS = 900
@@ -103,3 +105,119 @@ def conviction_stake(
         return base_usd
     frac = min_frac + (1.0 - min_frac) * (p_side - p_floor) / (p_full - p_floor)
     return base_usd * min(1.0, max(min_frac, frac))
+
+
+def _logit(p: float) -> float:
+    """Log-odds of ``p``, clamped just inside (0, 1) so it stays finite."""
+    p = min(1.0 - 1e-9, max(1e-9, p))
+    return math.log(p / (1.0 - p))
+
+
+def _sigmoid(x: float) -> float:
+    """Inverse of ``_logit`` — maps a log-odds back to a probability in (0, 1)."""
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def z_momentum(closes: Sequence[float], k: int = 3, n: int = 20) -> float:
+    """Volatility-normalised momentum of the last ``k`` bar log-returns.
+
+    ``closes`` is a chronological series of bar closes (oldest first, newest
+    last). Returns a unitless Sharpe-like z-score::
+
+        r_i   = ln(close_i / close_{i-1})
+        sigma = stdev(last n returns)
+        z     = (sum of last k returns) / (sigma * sqrt(k))
+
+    A large ``|z|`` means the recent move is big relative to its own noise; the
+    sign is the move's direction. This is the one feature partially ORTHOGONAL
+    to the book — the thin 15m Polymarket book may not yet price a real spot
+    move. Returns ``0.0`` (neutral, no influence on the posterior) when there is
+    too little history or volatility is zero, so it can never fabricate a signal.
+    """
+    if k < 1 or n < 2 or len(closes) < n + 1:
+        return 0.0
+    rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+    window = rets[-n:]
+    mean = sum(window) / len(window)
+    var = sum((r - mean) ** 2 for r in window) / (len(window) - 1)
+    sigma = math.sqrt(var)
+    if sigma <= 0.0:
+        return 0.0
+    momentum = sum(rets[-k:])
+    return momentum / (sigma * math.sqrt(k))
+
+
+def confirm_probability(
+    p_side: float,
+    base_rate: float,
+    beta_book: float,
+    p_bar: float = 0.5,
+    beta_mom: float = 0.0,
+    z_mom: float = 0.0,
+) -> float:
+    """Calibrated win-probability for a signal whose book-implied prob is ``p_side``.
+
+    This is the smooth generalisation of the hard book-agreement floor in
+    ``conviction_stake``: instead of a binary ``p_side >= p_floor`` cut, it
+    updates the signal's historical hit-rate (``base_rate``, the prior) with the
+    market's view AND the underlying's own move in log-odds space::
+
+        logit(P_win) = logit(base_rate)
+                       + beta_book * (p_side - p_bar)     # the order book
+                       + beta_mom  * z_mom                # spot momentum (Phase 2)
+
+    The book term nudges the prior up when the market agrees the bet is likely
+    (``p_side > p_bar``) and down when it disagrees; ``z_mom`` (from
+    ``z_momentum``) adds the orthogonal spot-momentum lean. Degenerate settings
+    keep the change honest and tunable from the backtest:
+
+    * ``beta_mom == 0``       -> Phase-1 book-only posterior (z_mom ignored).
+    * ``beta_book == 0``      -> flat prior, ``P_win == base_rate`` for every book.
+    * ``base_rate == 0.5`` with a large ``beta_book`` and ``p_bar == p_floor``
+      (and ``beta_mom == 0``) reproduces the hard floor exactly.
+
+    All coefficients are fit via ``backtest tune``, never hand-set (mirrors
+    ``conviction_stake``'s floor/full/frac being swept there).
+    """
+    return _sigmoid(_logit(base_rate) + beta_book * (p_side - p_bar) + beta_mom * z_mom)
+
+
+def fee_breakeven_prob(price: float, fee_rate: float) -> float:
+    """Minimum true win-prob to break even buying one side at ``price`` after fee.
+
+    The Polymarket taker fee is skimmed in shares (``matching.simulate_market_buy``):
+    a buy of ``S`` at ``price`` nets ``(S/price) * (1 - fee_rate*(1-price))`` shares,
+    so expected PnL is zero at::
+
+        q_breakeven = price / (1 - fee_rate * (1 - price))
+
+    With ``fee_rate == 0`` this collapses to ``price`` itself (pay-the-probability
+    fair value). A confirmation must clear this, not merely ``P_win > 0.5`` — the
+    fee bites hardest near ``price == 0.5`` where these signals tend to land.
+    """
+    denom = 1.0 - fee_rate * (1.0 - price)
+    return price / denom if denom > 0.0 else 1.0
+
+
+def confirm_signal(
+    p_side: float,
+    price: float,
+    base_rate: float,
+    beta_book: float,
+    tau: float,
+    fee_rate: float = 0.0,
+    p_bar: float = 0.5,
+    beta_mom: float = 0.0,
+    z_mom: float = 0.0,
+) -> bool:
+    """Calibrated confirmation gate: trade iff the posterior win-prob clears both
+    the tuned threshold ``tau`` AND the fee-adjusted breakeven for ``price``.
+
+    Generalises the ``stake > 0`` book-agreement gate. ``base_rate == 0.5``,
+    ``p_bar == p_floor``, large ``beta_book``, ``tau == 0.5``, ``fee_rate == 0``
+    and ``beta_mom == 0`` reproduce the old ``p_side >= p_floor`` decision
+    exactly, so a backtest sweep that includes that config can never report worse
+    than the current gate. ``beta_mom``/``z_mom`` add the Phase-2 momentum term.
+    """
+    p_win = confirm_probability(p_side, base_rate, beta_book, p_bar, beta_mom, z_mom)
+    return p_win >= tau and p_win > fee_breakeven_prob(price, fee_rate)
