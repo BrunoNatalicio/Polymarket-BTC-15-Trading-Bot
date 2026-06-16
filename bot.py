@@ -83,6 +83,7 @@ from execution.risk_engine import get_risk_engine
 from feedback.learning_engine import get_learning_engine
 from monitoring.grafana_exporter import get_grafana_exporter
 from monitoring.performance_tracker import get_performance_tracker
+from redis_resilience import ensure_client
 from tv_market_select import (
     conviction_stake,
     entry_prob_and_price,
@@ -145,24 +146,39 @@ class PaperTrade:
         }
 
 
-def init_redis():
-    """Initialize Redis connection for simulation mode control."""
-    try:
-        redis_client = redis.Redis(
-            host=os.getenv("REDIS_HOST", "localhost"),
-            port=int(os.getenv("REDIS_PORT", 6379)),
-            db=int(os.getenv("REDIS_DB", 2)),
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_keepalive=True,
-        )
-        redis_client.ping()
-        logger.info("Redis connection established")
-        return redis_client
-    except Exception as e:
-        logger.warning(f"Redis connection failed: {e}")
-        logger.warning("Simulation mode will be static (from .env)")
-        return None
+def init_redis(retries: int = 1, delay: float = 3.0):
+    """Initialize Redis connection for simulation mode control.
+
+    Tries up to ``retries`` times, sleeping ``delay`` seconds between attempts,
+    so a Redis that is still coming up during boot (e.g. WSL just restarted)
+    doesn't permanently degrade the bot. ``retries=1`` (the default) preserves
+    the original single-shot behaviour for the per-iteration reconnect path,
+    which has its own back-off loop.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            redis_client = redis.Redis(
+                host=os.getenv("REDIS_HOST", "localhost"),
+                port=int(os.getenv("REDIS_PORT", 6379)),
+                db=int(os.getenv("REDIS_DB", 2)),
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_keepalive=True,
+            )
+            redis_client.ping()
+            if attempt > 1:
+                logger.info(f"Redis connection established (attempt {attempt})")
+            else:
+                logger.info("Redis connection established")
+            return redis_client
+        except Exception as e:
+            last_err = e
+            if attempt < max(1, retries):
+                time.sleep(delay)
+    logger.warning(f"Redis connection failed: {last_err}")
+    logger.warning("Simulation mode will be static (from .env)")
+    return None
 
 
 class IntegratedBTCStrategy(Strategy):
@@ -173,7 +189,14 @@ class IntegratedBTCStrategy(Strategy):
     - Correct timing for market switching
     """
 
-    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False):
+    def __init__(
+        self,
+        redis_client=None,
+        enable_grafana=True,
+        test_mode=False,
+        simulation=True,
+        redis_mode_synced=True,
+    ):
         super().__init__()
 
         self.bot_start_time = datetime.now(UTC)
@@ -183,6 +206,20 @@ class IntegratedBTCStrategy(Strategy):
         self.instrument_id = None
         self.redis_client = redis_client
         self.current_simulation_mode = False
+
+        # Redis resilience (2026-06-16 outage): the webhook consumer reconnects
+        # on its own, so a Redis that is down at boot or drops at runtime no
+        # longer leaves the bot permanently unable to process webhooks.
+        self._session_simulation = simulation
+        # One-shot: True only when the boot-time simulation_mode set was skipped
+        # (Redis unreachable at boot). The consumer re-forces the session mode
+        # the first time it connects, then clears this — so a stale value from a
+        # previous run can't silently override the session, while runtime mode
+        # changes via redis_control survive a later reconnect.
+        self._redis_mode_pending = not redis_mode_synced
+        self._redis_reconnect_interval_s = float(
+            os.getenv("REDIS_RECONNECT_SECONDS", "5")
+        )
 
         # Store ALL BTC instruments
         self.all_btc_instruments: list[dict] = []
@@ -443,9 +480,11 @@ class IntegratedBTCStrategy(Strategy):
         # =========================================================================
         self.run_in_executor(self._start_timer_loop)
 
-        # TradingView webhook consumer (signals queued by tradingview_webhook_receiver.py)
-        if self.redis_client:
-            self.run_in_executor(self._start_webhook_consumer)
+        # TradingView webhook consumer (signals queued by tradingview_webhook_receiver.py).
+        # Always start it: the consumer (re)connects to Redis itself, so a Redis
+        # outage at boot no longer leaves the bot permanently unable to process
+        # webhooks (2026-06-16 incident).
+        self.run_in_executor(self._start_webhook_consumer)
 
         if self.grafana_exporter:
             import threading
@@ -1012,22 +1051,65 @@ class IntegratedBTCStrategy(Strategy):
         process). BLPOP wakes within milliseconds of a new signal, so
         "execute immediately" is met without polling.
         """
-        redis_client = self.redis_client
-        if redis_client is None:
-            return
         logger.info(
             "TradingView webhook consumer started "
-            "(BLPOP btc_trading:tradingview_signals)"
+            "(BLPOP btc_trading:tradingview_signals; self-healing Redis)"
         )
         while True:
+            client = self._ensure_redis_client()
+            if client is None:
+                # Redis still unreachable (down at boot or a runtime drop):
+                # back off and retry instead of exiting permanently.
+                time.sleep(self._redis_reconnect_interval_s)
+                continue
+            self._sync_session_mode_if_pending(client)
             try:
-                item = redis_client.blpop("btc_trading:tradingview_signals", timeout=5)
+                item = client.blpop("btc_trading:tradingview_signals", timeout=5)
                 if item is None:
                     continue
                 self._handle_tradingview_signal(item[1])
             except Exception as e:
                 logger.error(f"Webhook consumer error: {e}")
+                # Force a reconnect on the next iteration (the connection may
+                # have dropped); _ensure_redis_client will ping and rebuild it.
+                self.redis_client = None
                 time.sleep(2)
+
+    def _ensure_redis_client(self):
+        """Return a live Redis client, reconnecting if needed (may be None).
+
+        Delegates the reuse-vs-reconnect decision to the pure
+        ``redis_resilience.ensure_client`` and caches the result back on
+        ``self.redis_client`` so the rest of the strategy (check_simulation_mode,
+        get_active_strategy, _handle_tradingview_signal) sees the fresh handle.
+        """
+        self.redis_client = ensure_client(
+            self.redis_client, init_redis, lambda c: c.ping()
+        )
+        return self.redis_client
+
+    def _sync_session_mode_if_pending(self, redis_client) -> None:
+        """One-shot: re-force the session's sim/live mode after a late reconnect.
+
+        Only fires when the boot-time set was skipped because Redis was down
+        (``_redis_mode_pending``). It runs once on the first successful
+        connection, then clears the flag — so a stale simulation_mode from a
+        previous run can't silently override this session, while a mode change
+        made via redis_control after boot survives a later reconnect blip.
+        """
+        if not self._redis_mode_pending:
+            return
+        try:
+            mode_value = "1" if self._session_simulation else "0"
+            redis_client.set("btc_trading:simulation_mode", mode_value)
+            mode_label = "SIMULATION" if self._session_simulation else "LIVE"
+            logger.warning(
+                f"Redis recovered — session mode re-forced to {mode_label} "
+                f"({mode_value})"
+            )
+            self._redis_mode_pending = False
+        except Exception as e:
+            logger.warning(f"Could not re-force session mode after reconnect: {e}")
 
     def _handle_tradingview_signal(self, raw: str):
         """Validate and execute one queued TradingView signal."""
@@ -1965,8 +2047,18 @@ def run_integrated_bot(
     print("Nautilus + 7-Phase System + Redis Control")
     print("=" * 80)
 
-    redis_client = init_redis()
+    # Short bounded retry so a Redis still coming up during boot (e.g. WSL just
+    # restarted) doesn't permanently degrade the bot. ~12s by default, well
+    # within the runner's BOT_STARTUP_TIMEOUT_S (120s).
+    redis_client = init_redis(
+        retries=int(os.getenv("REDIS_CONNECT_RETRIES", "5")),
+        delay=float(os.getenv("REDIS_CONNECT_RETRY_DELAY", "3")),
+    )
 
+    # Tracks whether the session mode was actually written to Redis. If Redis
+    # was down at boot (set skipped), the webhook consumer re-forces it once on
+    # its first reconnect (see _sync_session_mode_if_pending).
+    redis_mode_synced = False
     if redis_client:
         try:
             # ALWAYS overwrite Redis with the current session mode.
@@ -1974,6 +2066,7 @@ def run_integrated_bot(
             # silently overriding --test-mode or --simulation runs.
             mode_value = "1" if simulation else "0"
             redis_client.set("btc_trading:simulation_mode", mode_value)
+            redis_mode_synced = True
             mode_label = "SIMULATION" if simulation else "LIVE"
             logger.info(f"Redis simulation_mode forced to: {mode_label} ({mode_value})")
         except Exception as e:
@@ -2059,6 +2152,8 @@ def run_integrated_bot(
         redis_client=redis_client,
         enable_grafana=enable_grafana,
         test_mode=test_mode,
+        simulation=simulation,
+        redis_mode_synced=redis_mode_synced,
     )
 
     print("\nBuilding Nautilus node...")

@@ -74,6 +74,8 @@ def detect_project_type(project_path: Path) -> dict:
                     "tradingview_webhook_receiver.py",
                     "test_tradingview_webhook.py",
                     "redis_control.py",
+                    "redis_resilience.py",
+                    "tv_market_select.py",
                 ],
             })
 

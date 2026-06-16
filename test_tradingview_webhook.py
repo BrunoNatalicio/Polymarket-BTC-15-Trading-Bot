@@ -398,6 +398,48 @@ def test_z_momentum():
     check("positive z_mom lifts posterior", p_dn < p0 < p_up)
 
 
+def test_redis_resilience():
+    print("\n12. Redis resilience (self-healing ensure_client)")
+    from redis_resilience import ensure_client
+
+    calls = {"connect": 0}
+
+    def make_connect(result):
+        def _connect():
+            calls["connect"] += 1
+            return result
+
+        return _connect
+
+    def ping_dead(_c):
+        raise ConnectionError("dead connection")
+
+    # Healthy current client is reused; connect() is never called (no churn).
+    calls["connect"] = 0
+    healthy = object()
+    out = ensure_client(healthy, make_connect("NEW"), lambda _c: True)
+    check("healthy client reused", out is healthy)
+    check("no reconnect when healthy", calls["connect"] == 0)
+
+    # current is None (Redis down at boot) -> reconnect via connect().
+    calls["connect"] = 0
+    out = ensure_client(None, make_connect("NEW"), lambda _c: True)
+    check("None reconnects (boot-down recovery)", out == "NEW")
+    check("connect called once on None", calls["connect"] == 1)
+
+    # ping raises (dropped connection) -> reconnect.
+    out = ensure_client(object(), make_connect("NEW"), ping_dead)
+    check("dead ping reconnects", out == "NEW")
+
+    # ping returns falsey -> reconnect.
+    out = ensure_client(object(), make_connect("NEW"), lambda _c: False)
+    check("falsey ping reconnects", out == "NEW")
+
+    # ping dead AND Redis still unreachable -> None (caller backs off & retries).
+    out = ensure_client(object(), make_connect(None), ping_dead)
+    check("still-down reconnect yields None", out is None)
+
+
 def test_redis_roundtrip():
     print("\n5. Redis round-trip")
     client = get_redis_client()
@@ -538,6 +580,7 @@ def main() -> int:
     test_entry_gate_and_sizing()
     test_calibrated_confirmation()
     test_z_momentum()
+    test_redis_resilience()
     test_redis_roundtrip()
     test_http_end_to_end()
 
