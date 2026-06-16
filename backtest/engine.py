@@ -124,12 +124,16 @@ def run_replay(
     reproduce the flat-stake baseline exactly, so a sweep that includes the
     defaults can never report a config worse than baseline.
 
-    ``confirm_side`` (e.g. ``"UP"``) swaps the book-agreement floor for the
-    calibrated confirmation gate (``tv_market_select.confirm_signal``) on that
+    ``confirm_side`` (``"UP"`` or ``"DOWN"``) swaps the book-agreement floor for
+    the calibrated confirmation gate (``tv_market_select.confirm_signal``) on that
     side ONLY — the other side keeps ``conviction_stake`` untouched. Default
     ``None`` disables it entirely, so existing callers/sweeps are byte-for-byte
-    unchanged. Applied to UP first; DOWN stays on the floor until its execution
-    bug is fixed (no statistical filter repairs an execution failure).
+    unchanged. Both sides are supported symmetrically: the earlier DOWN execution
+    bug (instrument drop + entry-price mis-record) was fixed in ``a1b8f52`` —
+    realized DOWN win-rate now tracks the replay (≈57%), so DOWN is a valid
+    ``--confirm-side`` target. The ``MIN_LIVE_SAMPLE`` guard in
+    ``cmd_tune_confirm`` still suppresses suggested live defaults until a side has
+    enough settled trades, so a thin DOWN sample can be swept but never auto-armed.
     """
     slug_prefix, window_seconds = SERIES[series]
     report = ReplayReport(start_ts=start_ts, end_ts=end_ts, stake_usd=stake_usd)
