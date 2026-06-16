@@ -582,6 +582,71 @@ def test_calibration():
     check("thin favorite is gated out", gate("DOWN", 0.55) is False)
 
 
+def test_cpcv():
+    print("\n12. CPCV out-of-sample validation of the L1 gate")
+    from backtest.cpcv import (
+        Fill,
+        cpcv_splits,
+        purge_embargo,
+        run_cpcv,
+        score_path,
+    )
+
+    # cpcv_splits: C(4,1)=4 paths, each group tested once; train+test partition.
+    splits = cpcv_splits(n_items=12, n_groups=4, k_test=1)
+    check("C(4,1) = 4 splits", len(splits) == 4)
+    check(
+        "train+test cover all, disjoint",
+        all(sorted(tr + te) == list(range(12)) for tr, te in splits),
+    )
+
+    # purge_embargo: a train fill within embargo_s of a test fill is dropped.
+    fills_pe = [Fill(ts=float(i * 900), p_side=0.6, won=1.0, pnl=1.0) for i in range(6)]
+    kept = purge_embargo(fills_pe, train_idx=[0, 1, 2], test_idx=[3], embargo_s=900)
+    check("embargo drops the neighbor (idx 2 at 1 window)", 2 not in kept)
+    check("embargo keeps the far ones (0,1)", kept == [0, 1])
+
+    # score_path: a clearly -EV thin favorite in test should be gated OUT, so L1
+    # avoids its loss -> delta > 0. Train must teach the calibrator that low
+    # p_side loses. Build separable train: p<0.6 loses, p>=0.7 wins.
+    train_fills = (
+        [Fill(0.0, 0.50, 0.0, -3.0) for _ in range(40)]  # thin favorites lose
+        + [Fill(0.0, 0.85, 1.0, +0.5) for _ in range(40)]  # strong favorites win
+    )
+    test_fills = [
+        Fill(0.0, 0.50, 0.0, -3.0),  # -EV: gate should drop -> avoids -3
+        Fill(0.0, 0.85, 1.0, +0.5),  # +EV: gate keeps -> +0.5
+    ]
+    allf = train_fills + test_fills
+    tr = list(range(len(train_fills)))
+    te = [len(train_fills), len(train_fills) + 1]
+    sp = score_path(allf, tr, te, fee_rate=0.07)
+    check("gate drops the thin -EV test fill", sp["gated_in"] == 1)
+    check("L1 beats L0 when a -EV fill is avoided", sp["delta"] > 0)
+
+    # run_cpcv verdict: with few losses, minority guard fires INSUFFICIENT.
+    few_loss = [Fill(float(i * 900), 0.8, 1.0, 0.5) for i in range(50)] + [
+        Fill(float(50 * 900), 0.5, 0.0, -3.0)
+    ]
+    res = run_cpcv(few_loss, n_groups=4, k_test=1, min_minority=100)
+    check("scarce losses -> INSUFFICIENT verdict", res["verdict"] == "INSUFFICIENT")
+    check("reports total losses", res["total_losses"] == 1)
+
+    # With enough minority and a real edge, the verdict can be ADDS EDGE.
+    import random
+
+    rng = random.Random(0)
+    many: list[Fill] = []
+    for i in range(400):
+        p = rng.choice([0.50, 0.85])
+        won = 1.0 if (p > 0.6 or rng.random() < 0.45) else 0.0
+        pnl = (0.5 if won else -3.0) if p > 0.6 else (2.0 if won else -3.0)
+        many.append(Fill(float(i * 900), p, won, pnl))
+    res2 = run_cpcv(many, n_groups=5, k_test=1, min_minority=50)
+    check("sufficient minority -> not INSUFFICIENT", res2["verdict"] != "INSUFFICIENT")
+    check("aggregate has all paths", res2["n_paths"] == 5)
+
+
 def main() -> int:
     print("=" * 60)
     print("BACKTEST REPLAY ENGINE - TESTS")
@@ -598,6 +663,7 @@ def main() -> int:
     test_z_mom_ingest()
     test_fusion_replay()
     test_calibration()
+    test_cpcv()
 
     print("\n" + "=" * 60)
     print(f"RESULT: {PASSED} passed, {FAILED} failed")

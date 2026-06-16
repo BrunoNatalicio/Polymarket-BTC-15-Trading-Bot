@@ -643,6 +643,94 @@ def cmd_fusion_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fusion_cpcv(args: argparse.Namespace) -> int:
+    from backtest.cpcv import fills_from_trades, run_cpcv
+    from backtest.fusion_replay import run_fusion_replay
+    from backtest.settlement import settle_backfill
+
+    start = _parse_when(args.start) if args.start else 0.0
+    end = _parse_when(args.end) if args.end else time.time()
+    con = db.connect()
+    try:
+        settle_backfill(con)
+        rep = run_fusion_replay(
+            con,
+            start_ts=start,
+            end_ts=end,
+            stake_usd=args.stake,
+            fee_rate=args.fee_rate,
+            series=args.series,
+            entry_second=args.entry_second,
+            entry_tolerance=args.entry_tolerance,
+            trend_up=args.trend_up,
+            trend_down=args.trend_down,
+        )
+    finally:
+        con.close()
+
+    fills = fills_from_trades(rep.settled)
+    res = run_cpcv(
+        fills,
+        n_groups=args.n_groups,
+        k_test=args.k_test,
+        embargo_windows=args.embargo_windows,
+        fee_rate=args.fee_rate,
+        l2=args.l2,
+        min_minority=args.min_minority,
+    )
+
+    line = "=" * 70
+    print(line)
+    print("FUSION CPCV — validacao out-of-sample do gate de EV (L1)")
+    print(line)
+    if res["n_paths"] == 0:
+        print(f"  Sem caminhos (fills={len(fills)}). Janela/dados insuficientes.")
+        print(line)
+        return 0
+    print(
+        f"Fills L0 settled : {res['n_fills']}  "
+        f"(wins {res['total_wins']} / losses {res['total_losses']})"
+    )
+    print(
+        f"CPCV             : C({args.n_groups},{args.k_test}) = {res['n_paths']} caminhos "
+        f"| embargo {args.embargo_windows:.0f} janela(s) | fee={args.fee_rate:.2f}"
+    )
+    print("-" * 70)
+    print(
+        f"  {'path':>4} {'n_test':>6} {'gated':>6} {'L0 PnL':>9} {'L1 PnL':>9} {'delta':>9}"
+    )
+    for i, p in enumerate(res["paths"]):
+        print(
+            f"  {i:>4} {p['n_test']:>6} {p['gated_in']:>6} "
+            f"{p['l0_pnl']:>+9.2f} {p['l1_pnl']:>+9.2f} {p['delta']:>+9.2f}"
+        )
+    print("-" * 70)
+    print(
+        f"  delta medio (L1-L0): ${res['mean_delta']:+.2f} (desvio ${res['stdev_delta']:.2f})"
+    )
+    print(
+        f"  L1 > L0          : {res['pct_l1_beats_l0']:.0%} dos caminhos | "
+        f"L1 PnL>0: {res['pct_l1_positive']:.0%}"
+    )
+    print(
+        f"  PnL medio/path   : L0 ${res['mean_l0_pnl']:+.2f}  vs  L1 ${res['mean_l1_pnl']:+.2f}"
+    )
+    print(
+        f"  min losses treino: {res['min_train_losses']} (limite min-minority "
+        f"{res['min_minority']})"
+    )
+    print("-" * 70)
+    verdict_msg = {
+        "INSUFFICIENT": "INSUFICIENTE — poucas perdas para validar o calibrador "
+        "(amostra da classe minoritaria abaixo do limite). Colete mais dados.",
+        "L1 ADDS EDGE": "L1 AGREGA — bate o L0 out-of-sample na maioria dos caminhos.",
+        "NO GAIN": "SEM GANHO — L1 nao supera o L0 baseline out-of-sample.",
+    }
+    print(f"  VEREDITO: {res['verdict']} — {verdict_msg.get(res['verdict'], '')}")
+    print(line)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="backtest")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -791,6 +879,39 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_fusion.add_argument("--out-csv", help="optional path to dump per-trade rows")
 
+    p_cpcv = sub.add_parser(
+        "fusion-cpcv",
+        help="validate the L1 EV gate out-of-sample via Combinatorial Purged CV",
+    )
+    p_cpcv.add_argument("--start", help="ISO date/datetime or unix seconds")
+    p_cpcv.add_argument("--end", help="ISO date/datetime or unix seconds")
+    p_cpcv.add_argument("--series", choices=["15m", "5m"], default="15m")
+    p_cpcv.add_argument("--stake", type=float, default=3.0)
+    p_cpcv.add_argument("--fee-rate", type=float, default=0.07)
+    p_cpcv.add_argument("--entry-second", type=float, default=810.0)
+    p_cpcv.add_argument("--entry-tolerance", type=float, default=30.0)
+    p_cpcv.add_argument("--trend-up", type=float, default=0.60)
+    p_cpcv.add_argument("--trend-down", type=float, default=0.40)
+    p_cpcv.add_argument(
+        "--n-groups", type=int, default=6, help="contiguous time blocks (default 6)"
+    )
+    p_cpcv.add_argument(
+        "--k-test", type=int, default=2, help="test blocks per split (default 2)"
+    )
+    p_cpcv.add_argument(
+        "--embargo-windows",
+        type=float,
+        default=1.0,
+        help="purge train fills within this many 15m windows of a test fill (default 1)",
+    )
+    p_cpcv.add_argument("--l2", type=float, default=1e-3, help="Platt ridge strength")
+    p_cpcv.add_argument(
+        "--min-minority",
+        type=int,
+        default=100,
+        help="min train losses to trust a fit; below this the verdict is INSUFFICIENT",
+    )
+
     args = parser.parse_args(argv)
     handlers = {
         "record": cmd_record,
@@ -800,6 +921,7 @@ def main(argv: list[str] | None = None) -> int:
         "report": cmd_report,
         "tune": cmd_tune,
         "fusion-replay": cmd_fusion_replay,
+        "fusion-cpcv": cmd_fusion_cpcv,
     }
     return handlers[args.command](args)
 
