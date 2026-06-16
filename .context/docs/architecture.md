@@ -19,8 +19,13 @@ state (current market, simulation mode, active strategy).
 
 ## System Architecture Overview
 
-`15m_bot_runner.py` is the supervisor: it launches `bot.py` as a subprocess and restarts it every ~90 minutes (and
-on crash). `bot.py` applies two monkey patches ([patch_gamma_markets.py](../../patch_gamma_markets.py),
+`15m_bot_runner.py` is the supervisor: it launches `bot.py` as a non-blocking `Popen` subprocess and restarts it
+every ~90 minutes (and on crash). A **startup watchdog** guards each boot — it tails `logs/bot.log` for the
+`on_start` completion marker (`Strategy active …`, logged only after the live node connects), and if that marker
+does not appear within `BOT_STARTUP_TIMEOUT_S` (default 120s) it kills the process tree (`taskkill /T` on Windows)
+and relaunches. This catches a boot that hangs *inside* `node.run()` before `on_start` (an intermittent Polymarket
+client-connect stall), which would otherwise leave the bot alive-but-frozen and the supervisor blocked indefinitely.
+`bot.py` applies two monkey patches ([patch_gamma_markets.py](../../patch_gamma_markets.py),
 [patch_market_orders.py](../../patch_market_orders.py)) before importing NautilusTrader, then constructs
 `IntegratedBTCStrategy`, which is registered with the NautilusTrader engine via
 [core/nautilus_core/data_engine/engine_wrapper.py](../../core/nautilus_core/data_engine/engine_wrapper.py).
