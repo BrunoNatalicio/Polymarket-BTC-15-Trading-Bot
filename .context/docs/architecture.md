@@ -37,8 +37,10 @@ Two control planes run alongside the strategy:
   separate stdlib `http.server` process on port 8001 that pushes validated alerts onto a Redis list, consumed by a
   background thread inside `bot.py`.
 
-On each cycle the strategy either runs the fusion path (combine signals -> fuse -> risk-check -> execute) or, if
-`active_strategy == "tradingview"`, skips fusion and acts only on webhook signals.
+On each cycle the strategy either runs the fusion path or, if `active_strategy == "tradingview"`, skips fusion
+and acts only on webhook signals. Note the deployed **fusion** path is a *late-window favorite-follower*: at
+minute ~13 it uses the fused signal only as an **activity gate**, then sets direction by **following the
+Polymarket price** (a trend filter), not by the fused vote — see [fusion-strategy.md](fusion-strategy.md).
 
 ## Architectural Layers
 
@@ -175,5 +177,6 @@ On each cycle the strategy either runs the fusion path (combine signals -> fuse 
 ## Related Resources
 
 - [project-overview.md](project-overview.md)
+- [fusion-strategy.md](fusion-strategy.md) — the deployed fusion strategy (favorite-follower) in detail
 - [data-flow.md](data-flow.md)
 - [../../CLAUDE.md](../../CLAUDE.md)

@@ -1,6 +1,6 @@
 # Project Rules and Guidelines
 
-> Auto-generated from .context/docs on 2026-06-16T20:40:48.078Z
+> Auto-generated from .context/docs on 2026-06-16T22:21:43.149Z
 
 ## rules-CLAUDE
 
@@ -102,14 +102,14 @@ Both patches are applied at module load time in `bot.py`. If either fails, the p
 All signal processors live in `core/strategy_brain/signal_processors/` and extend `BaseSignalProcessor` (`base_processor.py`). Each processor outputs a `TradingSignal` with `direction` (BULLISH/BEARISH/NEUTRAL), `confidence` (0–1), and `strength`.
 
 Active processors wired into `bot.py`:
-- `SpikeDetectionProcessor` — detects price spikes from Binance/Coinbase divergence
-- `PriceDivergenceProcessor` — cross-exchange price divergence
+- `SpikeDetectionProcessor` — mean-reversion + velocity on the **Polymarket UP-probability** series (not Binance/Coinbase)
+- `PriceDivergenceProcessor` — Polymarket UP probability vs BTC spot momentum (extreme-prob fade + momentum mispricing)
 - `SentimentProcessor` — Fear & Greed index + social sentiment
 - `OrderBookImbalanceProcessor` — bid/ask depth imbalance
 - `TickVelocityProcessor` — trade arrival rate anomalies
 - `DeribitPCRProcessor` — Deribit put/call ratio
 
-`SignalFusionEngine` (`core/strategy_brain/fusion_engine/signal_fusion.py`) combines all signals using weighted voting. Default weights: Spike 40%, Divergence 30%, Sentiment 20%, others 10%. A `FusedSignal` is **actionable** when `score >= 60` and `confidence >= 0.6`, **strong** when `score >= 70`.
+`SignalFusionEngine` (`core/strategy_brain/fusion_engine/signal_fusion.py`) combines signals by weighted voting into a `FusedSignal`. The engine's constructor defaults (Spike 40 / Divergence 30 / Sentiment 20) are **overridden at runtime** in `on_start` (OrderBookImbalance 0.30, TickVelocity 0.25, PriceDivergence 0.18, SpikeDetection 0.12, DeribitPCR 0.10, Sentiment 0.05). **Important:** the deployed fusion strategy does **not** trade the fused *direction* — it uses the fusion only as an *activity gate* (trades if `fuse_signals` returns non-None at minute ~13) and then **follows the Polymarket price** (a TREND FILTER: UP-mid > 0.60 → buy YES, < 0.40 → buy NO, 0.40–0.60 → skip). The `is_actionable` (`score≥60 & conf≥0.6`) / `is_strong` (`≥70`) properties exist but do not gate the trade. See [.context/docs/fusion-strategy.md](.context/docs/fusion-strategy.md) for the full mechanics.
 
 ### Learning feedback loop
 
@@ -237,6 +237,7 @@ Welcome to the repository knowledge base. Start with the project overview, then 
 - [Data Flow & Integrations](./data-flow.md)
 - [Security & Compliance Notes](./security.md)
 - [Tooling & Productivity Guide](./tooling.md)
+- [Fusion Strategy (default)](./fusion-strategy.md)
 - [TradingView Strategy Runbook](./tradingview-runbook.md)
 - [Backtest Validation & Reporting](./backtest-validation.md)
 - [TradingView Signal Confirmation Layer](./tv-confirmation-layer.md)
@@ -260,6 +261,7 @@ Welcome to the repository knowledge base. Start with the project overview, then 
 | Data Flow & Integrations | `data-flow.md` | System diagrams, integration specs, queue topics |
 | Security & Compliance Notes | `security.md` | Auth model, secrets management, compliance requirements |
 | Tooling & Productivity Guide | `tooling.md` | CLI scripts, IDE configs, automation workflows |
+| Fusion Strategy (default) | `fusion-strategy.md` | Late-window favorite-follower mechanics, signal-activity gate, calibration-brain roadmap, `fusion-replay` backtest |
 | TradingView Strategy Runbook | `tradingview-runbook.md` | Webhook setup, dry-run validation, go-live checklist, troubleshooting |
 | Backtest Validation & Reporting | `backtest-validation.md` | CLOB outcome resolution, settle/report commands, strategy-vs-bot hit-rate, pre-live fixes |
 

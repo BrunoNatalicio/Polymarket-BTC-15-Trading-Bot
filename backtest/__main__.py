@@ -514,6 +514,91 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fusion_replay(args: argparse.Namespace) -> int:
+    from backtest.fusion_replay import run_fusion_replay
+    from backtest.settlement import settle_backfill
+
+    start = _parse_when(args.start) if args.start else 0.0
+    end = _parse_when(args.end) if args.end else time.time()
+    con = db.connect()
+    try:
+        settle_backfill(con)
+        common = dict(
+            start_ts=start,
+            end_ts=end,
+            stake_usd=args.stake,
+            series=args.series,
+            entry_second=args.entry_second,
+            entry_tolerance=args.entry_tolerance,
+            trend_up=args.trend_up,
+            trend_down=args.trend_down,
+        )
+        rep = run_fusion_replay(con, fee_rate=args.fee_rate, **common)  # type: ignore[arg-type]
+        rep_gross = run_fusion_replay(con, fee_rate=0.0, **common)  # type: ignore[arg-type]
+    finally:
+        con.close()
+
+    s, s0 = rep.summary(), rep_gross.summary()
+    # Per-direction split (favorite was YES for UP, NO for DOWN).
+    strat: dict[str, list[float]] = {"UP": [0, 0, 0.0], "DOWN": [0, 0, 0.0]}
+    for t in rep.settled:
+        d = str(t["direction"])
+        strat[d][1] += 1
+        strat[d][0] += 1 if t["won"] else 0
+        strat[d][2] += t["pnl"]
+
+    def pct(w: float, n: float) -> str:
+        return f"{w / n:.0%}" if n else "n/a"
+
+    line = "=" * 70
+    print(line)
+    print("FUSION REPLAY — late-window favorite-follower (L0 baseline)")
+    print(line)
+    print(
+        f"Período : {datetime.fromtimestamp(start, tz=UTC):%Y-%m-%d %H:%M} -> "
+        f"{datetime.fromtimestamp(end, tz=UTC):%Y-%m-%d %H:%M} UTC"
+    )
+    print(
+        f"Série   : {args.series} | entrada ~{args.entry_second:.0f}s (±{args.entry_tolerance:.0f}s) "
+        f"| favorita >{args.trend_up:.2f} / <{args.trend_down:.2f} | stake=${args.stake:.2f} "
+        f"| fee={args.fee_rate:.2f}"
+    )
+    print("-" * 70)
+    print(
+        f"  Mercados         : {s['markets_total']}  "
+        f"(deadband-skip: {s['deadband_skip']}, sem book: {s['unfilled_no_data']}, "
+        f"sem liquidez: {s['unfilled_no_liquidity']})"
+    )
+    if s["settled"]:
+        print(
+            f"  Resolvidos       : {s['settled']} -> {s['wins']} WIN / "
+            f"{s['settled'] - s['wins']} LOSS ({s['win_rate']:.0%})"
+        )
+        for d in ("UP", "DOWN"):
+            w, n, pnl = strat[d]
+            print(
+                f"    {d:4}: {int(n)} trades | {int(w)} WIN | {pct(w, n)} | PnL ${pnl:+.2f}"
+            )
+        print(
+            f"  PnL com fee      : ${s['total_pnl']:+.2f} sobre ${s['total_staked']:.2f} "
+            f"| slip {s['avg_slippage_bps']:.0f} bps"
+        )
+        print(
+            f"  PnL sem fee      : ${s0['total_pnl']:+.2f}  (fee custou "
+            f"${s0['total_pnl'] - s['total_pnl']:+.2f})"
+        )
+    else:
+        print("  (nenhum mercado resolvido na janela)")
+    print(line)
+
+    if args.out_csv and rep.trades:
+        from backtest.engine import trades_dataframe
+
+        trades_dataframe(rep).to_csv(args.out_csv, index=False)
+        print(f"Trades written to {args.out_csv}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="backtest")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -615,6 +700,46 @@ def main(argv: list[str] | None = None) -> int:
         "(live-aligned close source); takes precedence over --closes-csv",
     )
 
+    p_fusion = sub.add_parser(
+        "fusion-replay",
+        help="replay the fusion strategy (late-window favorite-follower) on recorded books",
+    )
+    p_fusion.add_argument("--start", help="ISO date/datetime or unix seconds")
+    p_fusion.add_argument("--end", help="ISO date/datetime or unix seconds")
+    p_fusion.add_argument("--series", choices=["15m", "5m"], default="15m")
+    p_fusion.add_argument("--stake", type=float, default=3.0)
+    p_fusion.add_argument(
+        "--fee-rate",
+        type=float,
+        default=0.07,
+        help="taker fee rate; 15m/5m crypto = 0.07. PnL is reported with AND without it.",
+    )
+    p_fusion.add_argument(
+        "--entry-second",
+        type=float,
+        default=810.0,
+        help="seconds into the window to read the favorite (default 810 = minute 13.5)",
+    )
+    p_fusion.add_argument(
+        "--entry-tolerance",
+        type=float,
+        default=30.0,
+        help="± seconds band to find a snapshot around --entry-second (default 30 => 780-840s)",
+    )
+    p_fusion.add_argument(
+        "--trend-up",
+        type=float,
+        default=0.60,
+        help="buy YES when the UP mid is above this (default 0.60)",
+    )
+    p_fusion.add_argument(
+        "--trend-down",
+        type=float,
+        default=0.40,
+        help="buy NO when the UP mid is below this (default 0.40); deadband between = skip",
+    )
+    p_fusion.add_argument("--out-csv", help="optional path to dump per-trade rows")
+
     args = parser.parse_args(argv)
     handlers = {
         "record": cmd_record,
@@ -623,6 +748,7 @@ def main(argv: list[str] | None = None) -> int:
         "import-signals": cmd_import_signals,
         "report": cmd_report,
         "tune": cmd_tune,
+        "fusion-replay": cmd_fusion_replay,
     }
     return handlers[args.command](args)
 

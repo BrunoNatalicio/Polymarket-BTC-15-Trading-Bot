@@ -471,6 +471,88 @@ def test_z_mom_ingest():
     )
 
 
+def test_fusion_replay():
+    print("\n10. fusion replay (late-window favorite-follower, L0)")
+    import backtest.db as db
+    from backtest.fusion_replay import run_fusion_replay
+
+    con = db.connect(":memory:")
+    ws = [900_000_000 + i * 900 for i in range(4)]
+    # m0: favorite YES (mid 0.62) > 0.60 -> UP; outcome YES -> WIN
+    # m1: favorite NO  (YES mid 0.30) < 0.40 -> DOWN (buy NO); outcome NO -> WIN
+    # m2: deadband (YES mid 0.50) -> skip
+    # m3: UP favorite but NO snapshot in the entry band -> unfilled_no_data
+    for w in ws:
+        db.upsert_market(con, f"btc-updown-15m-{w}", f"Y{w}", f"N{w}", w, w + 900)
+    db.set_market_outcome(con, f"btc-updown-15m-{ws[0]}", "YES", "clob")
+    db.set_market_outcome(con, f"btc-updown-15m-{ws[1]}", "NO", "clob")
+    db.set_market_outcome(con, f"btc-updown-15m-{ws[2]}", "YES", "clob")
+    db.set_market_outcome(con, f"btc-updown-15m-{ws[3]}", "YES", "clob")
+
+    def snap(w, tok, side, bid, ask, depth=500.0, at=810):
+        db.insert_snapshot(
+            con,
+            ts=w + at,
+            market_slug=f"btc-updown-15m-{w}",
+            token_id=tok,
+            side_label=side,
+            bids=[(bid, depth)],
+            asks=[(ask, depth)],
+        )
+
+    # m0: YES mid 0.62 -> UP, buy YES at 0.63
+    snap(ws[0], f"Y{ws[0]}", "YES", 0.61, 0.63)
+    # m1: YES mid 0.30 -> DOWN, buy NO at 0.71 (NO mid 0.70)
+    snap(ws[1], f"Y{ws[1]}", "YES", 0.29, 0.31)
+    snap(ws[1], f"N{ws[1]}", "NO", 0.69, 0.71)
+    # m2: deadband 0.50
+    snap(ws[2], f"Y{ws[2]}", "YES", 0.49, 0.51)
+    # m3: YES snapshot OUTSIDE the entry band (at 100s) -> no_data
+    snap(ws[3], f"Y{ws[3]}", "YES", 0.61, 0.63, at=100)
+
+    rep = run_fusion_replay(
+        con, start_ts=ws[0], end_ts=ws[3] + 900, stake_usd=3.0, fee_rate=0.0
+    )
+    s = rep.summary()
+    check("4 markets scanned", s["markets_total"] == 4)
+    check("1 deadband skip (m2)", s["deadband_skip"] == 1)
+    check("1 no-data (m3 out of band)", s["unfilled_no_data"] == 1)
+    check("2 fills (m0 UP, m1 DOWN)", s["fills"] == 2)
+    check("both settled & won", s["settled"] == 2 and s["wins"] == 2)
+
+    by_dir = {str(t["direction"]): t for t in rep.settled}
+    check("m0 direction UP (bought YES)", "UP" in by_dir)
+    check("m1 direction DOWN (bought NO)", "DOWN" in by_dir)
+    # UP: $3 at 0.63 -> 4.7619 tokens, YES wins -> payout 4.7619, pnl +1.7619
+    up = by_dir["UP"]
+    check("UP pnl = 3/0.63 - 3", abs(up["pnl"] - (3.0 / 0.63 - 3.0)) < 1e-9)
+    # DOWN: $3 at 0.71 -> 4.2254 tokens, NO wins -> pnl +1.2254
+    dn = by_dir["DOWN"]
+    check("DOWN pnl = 3/0.71 - 3", abs(dn["pnl"] - (3.0 / 0.71 - 3.0)) < 1e-9)
+
+    # With the taker fee, the same wins pay a little less (fee skimmed in shares).
+    rep_fee = run_fusion_replay(
+        con, start_ts=ws[0], end_ts=ws[3] + 900, stake_usd=3.0, fee_rate=0.07
+    )
+    check(
+        "fee reduces total PnL",
+        rep_fee.summary()["total_pnl"] < s["total_pnl"],
+    )
+
+    # Deadband knobs: widen so 0.50 is no longer skipped (trend_up=0.49 -> m2 trades UP).
+    rep_wide = run_fusion_replay(
+        con,
+        start_ts=ws[2],
+        end_ts=ws[2] + 900,
+        stake_usd=3.0,
+        fee_rate=0.0,
+        trend_up=0.49,
+        trend_down=0.40,
+    )
+    check("widening trend_up trades the 0.50 market", rep_wide.summary()["fills"] == 1)
+    con.close()
+
+
 def main() -> int:
     print("=" * 60)
     print("BACKTEST REPLAY ENGINE - TESTS")
@@ -485,6 +567,7 @@ def main() -> int:
     test_clob_outcome()
     test_bot_trades()
     test_z_mom_ingest()
+    test_fusion_replay()
 
     print("\n" + "=" * 60)
     print(f"RESULT: {PASSED} passed, {FAILED} failed")
