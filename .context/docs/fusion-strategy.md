@@ -150,30 +150,36 @@ covers TradingView. The fusion backtest is its own command, **`fusion-replay`** 
 of the brain ladder in §7), reusing the same recorded books, matching, and CLOB settlement:
 
 ```bash
-uv run python -m backtest fusion-replay --series 15m --stake 3 --fee-rate 0.07
+uv run python -m backtest fusion-replay --series 15m --stake 3 --fee-rate 0.07   # L0 baseline
+uv run python -m backtest fusion-replay --series 15m --stake 3 --fee-rate 0.07 --gate ev  # L1 smoke (in-sample)
+uv run python -m backtest fusion-cpcv  --series 15m --stake 3 --fee-rate 0.07    # L1 out-of-sample (CPCV)
 ```
 
-It reconstructs each recorded market's UP-probability from the snapshot nearest `window_start +
---entry-second` (default 810s, ±`--entry-tolerance`), applies the TREND FILTER (follow favorite,
-`--trend-up`/`--trend-down` deadband) for direction, prices the bought token against its own recorded
-asks (taker fee), settles via `markets.outcome`, and reports win-rate + PnL **with and without the
-fee**, split UP/DOWN. Implemented in [backtest/fusion_replay.py](../../backtest/fusion_replay.py)
-(`run_fusion_replay`), tested in [backtest/test_backtest.py](../../backtest/test_backtest.py).
+`fusion-replay` reconstructs each recorded market's UP-probability from the snapshot nearest
+`window_start + --entry-second` (default 810s, ±`--entry-tolerance`), applies the TREND FILTER
+(follow favorite, `--trend-up`/`--trend-down` deadband) for direction, prices the bought token
+against its own recorded asks (taker fee), settles via `markets.outcome`, and reports win-rate + PnL
+**with and without the fee**, split UP/DOWN. Implemented in
+[backtest/fusion_replay.py](../../backtest/fusion_replay.py) (`run_fusion_replay`), tested in
+[backtest/test_backtest.py](../../backtest/test_backtest.py).
+
+**L0 result (in-sample, 2026-06-16, 15m series):** 300 fills, **278 W / 22 L (93%)**, **+$28.43**
+net of the taker fee on $897 staked (+$35.54 gross). → *Yes, the late favorite pays after the fee.*
 
 **Honest caveats:**
-- Because direction = "follow the favorite," this answers *"does the late favorite still pay after
-  the taker fee?"* — and on the recorded sample so far, **yes** (net positive).
 - **Selection effect:** when the favorite is near-certain (~$0.97+) there are often no asks to buy
   (nobody sells the sure winner), so those markets don't fill — exactly as live. The fills skew to
   the *less extreme* favorites.
-- L0 omits the processor **activity gate** and the calibration brain (§7); those are the next rungs,
-  and any live use must first clear CPCV out-of-sample validation, not just this in-sample read.
+- This is **in-sample**, but L0 is a **fixed rule** (no parameters fit to the data), so it isn't
+  overfit the way a *calibrated model* would be — which is why CPCV targets L1, not L0. The L1 gate
+  (§7) tried to refine L0 but **failed out-of-sample validation** (CPCV) — see the verdict in §7.
 
 ## 7. Planned Evolution — a Self-Learning Calibration Brain
 
-> Status: **design only, not implemented.** Output of a multi-agent debate (4 agents + prior-art
-> research). It adds *intelligence without changing the strategy*: the direction stays "follow the
-> favorite"; the brain only decides **whether** a given favorite is worth trading and **how much**.
+> Status: **L0 + L1 implemented and tested; L1 NOT armed (CPCV verdict below); L2/L3 design-only.**
+> Output of a multi-agent debate (4 agents + prior-art research). It adds *intelligence without
+> changing the strategy*: the direction stays "follow the favorite"; the brain only decides
+> **whether** a given favorite is worth trading and **how much**.
 
 The prior art is decisive: prediction markets show a **favorite-longshot bias** — high-price
 contracts (>$0.50) earn a small *positive* return, longshots bleed. The edge, if any, is in
@@ -201,9 +207,25 @@ Purged Cross-Validation** (purged + embargoed, López de Prado). A rung is armed
 beats the L0 baseline *and* the fee under CPCV, with ≥100 win / 100 loss settled events and a clean
 reliability diagram.
 
-**Open empirical question (gates everything above):** *does the late favorite pay after the taker
-fee?* That is exactly what the L0 `fusion-replay` (§6) measures — so it is built first; no rung is
-worth coding until L0 shows a real, fee-surviving edge to refine.
+### Validation status (2026-06-16)
+
+| Rung | State | Result |
+| --- | --- | --- |
+| **L0** | **live strategy** | in-sample +EV: 300 fills, 93% win, **+$28.43** net of fee (§6) |
+| **L1** | built, **NOT armed** | `backtest/calibration.py` + `fusion-replay --gate ev` + `fusion-cpcv`; CPCV verdict **INSUFFICIENT** (below) |
+| **L2 / L3** | design-only | gated on L1 passing first |
+
+**CPCV verdict on L1 (`fusion-cpcv`, C(6,2) = 15 paths):** mean Δ(L1−L0) = **−$2.88** (L1 *worse*
+out-of-sample), L1 beats L0 in only **13%** of paths, and **min losses/train = 11 ≪ 100** →
+**INSUFFICIENT**. Two findings: (a) at ~93% win there are only **~22 losses total** — the minority
+class is far too thin to calibrate a fee-edge gate; (b) the gate cuts +EV favorites. **Decision: keep
+L0 (the raw favorite-follower); do not arm L1.** The smoke test already hinted at this (in-sample L1
+$+24.42 < L0 $+28.43).
+
+**Re-run trigger (the binding constraint is LOSSES, not total fills).** The ≥100-win/100-loss bar is
+gated by the **loss** count (wins are the easy part at 93%). Re-run `fusion-cpcv` as the recorder
+accumulates data, and **only revisit L1 when `min losses/train ≥ ~100`** — at 93% win that needs
+~1400+ settled markets. Until then L0 *is* the strategy; no rung is worth arming.
 
 References: favorite-longshot bias and prediction-market calibration; Platt vs isotonic scaling;
 Kelly / fractional-Kelly sizing; OFI→price (Cont/Kukanov/Stoikov); CPCV (López de Prado); concept-
