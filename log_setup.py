@@ -17,13 +17,76 @@ Two rules baked in:
 `logs/` and `*.log` are gitignored.
 """
 
+import os
+import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from loguru import Record
 
 # repo-root/logs, resolved from this file so it is independent of each
 # process's working directory (the recorder runs as `python -m backtest`).
 _LOG_DIR = Path(__file__).resolve().parent / "logs"
+
+# Env vars whose VALUES must never reach a log line (stdout or file). Redaction
+# is value-based, not format-based, on purpose: a private key and a Polymarket
+# condition_id share the same 0x+64hex shape, so masking by format would also
+# wipe every (public) instrument_id from the logs. Masking the literal env value
+# is surgical — it only ever touches the actual secret.
+_SECRET_ENV_KEYS = (
+    "POLYMARKET_PK",
+    "POLYMARKET_API_KEY",
+    "POLYMARKET_API_SECRET",
+    "POLYMARKET_PASSPHRASE",
+    "TRADINGVIEW_WEBHOOK_SECRET",
+)
+_REDACTION = "***REDACTED***"
+
+
+def _build_secret_pattern() -> "re.Pattern[str] | None":
+    """Compile an alternation of the current env secret values, or None.
+
+    Longest first so the most specific value wins; empty/unset values are
+    skipped (an empty alternative would match between every character and
+    redact the whole line).
+    """
+    values = sorted(
+        {v for k in _SECRET_ENV_KEYS if (v := os.getenv(k))},
+        key=len,
+        reverse=True,
+    )
+    if not values:
+        return None
+    return re.compile("|".join(re.escape(v) for v in values))
+
+
+def enable_log_redaction() -> None:
+    """Mask literal env-secret values in every loguru record (safety net).
+
+    Registers a global loguru patcher that replaces any occurrence of a known
+    secret value in the message with ``***REDACTED***`` before formatting, so
+    it covers both stdout (default handler) and the file sink at once. This is
+    defense in depth, not encryption: it matches the secret exactly as it sits
+    in the environment, so a transformed form (e.g. a base64-decoded secret, or
+    the key without its 0x prefix) would not be caught. Does NOT cover
+    NautilusTrader's own logs — those never pass through loguru (and don't carry
+    credentials anyway).
+
+    No-op when no secrets are present in the environment.
+    """
+    pattern = _build_secret_pattern()
+    if pattern is None:
+        return
+
+    def _redact(record: "Record") -> None:
+        message = record.get("message")
+        if message:
+            record["message"] = pattern.sub(_REDACTION, message)
+
+    logger.configure(patcher=_redact)
 
 
 def setup_file_logging(filename: str) -> int:
@@ -31,7 +94,11 @@ def setup_file_logging(filename: str) -> int:
 
     UTF-8 is explicit because the logs carry ``✓``/``→``/emoji and the Windows
     consoles default to cp1252 (which would raise on write).
+
+    Also installs the secret-redaction safety net so credentials never reach the
+    file sink or stdout (see :func:`enable_log_redaction`).
     """
+    enable_log_redaction()
     return logger.add(
         _LOG_DIR / filename,
         level="INFO",

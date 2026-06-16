@@ -38,6 +38,13 @@ from loguru import logger
 
 load_dotenv()
 
+# Install the secret-redaction safety net right after env vars are loaded, so no
+# loguru line can leak a credential in the window before main() configures the
+# file sink. Idempotent with the call inside log_setup.setup_file_logging.
+from log_setup import enable_log_redaction  # noqa: E402
+
+enable_log_redaction()
+
 SIGNALS_KEY = "btc_trading:tradingview_signals"
 # Append-only copy of every accepted signal, drained exclusively by the
 # backtest recorder (python -m backtest record). The bot's BLPOP queue
