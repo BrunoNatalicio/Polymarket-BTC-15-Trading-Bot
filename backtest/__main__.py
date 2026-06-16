@@ -515,15 +515,18 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def cmd_fusion_replay(args: argparse.Namespace) -> int:
-    from backtest.fusion_replay import run_fusion_replay
+    from backtest.fusion_replay import FusionReplayReport, run_fusion_replay
     from backtest.settlement import settle_backfill
 
     start = _parse_when(args.start) if args.start else 0.0
     end = _parse_when(args.end) if args.end else time.time()
     con = db.connect()
+    coeffs: tuple[float, float] | None = None
+    rep_l1: FusionReplayReport | None = None
+    rep_l1_gross: FusionReplayReport | None = None
     try:
         settle_backfill(con)
-        common = dict(
+        common: dict[str, Any] = dict(
             start_ts=start,
             end_ts=end,
             stake_usd=args.stake,
@@ -533,26 +536,69 @@ def cmd_fusion_replay(args: argparse.Namespace) -> int:
             trend_up=args.trend_up,
             trend_down=args.trend_down,
         )
-        rep = run_fusion_replay(con, fee_rate=args.fee_rate, **common)  # type: ignore[arg-type]
-        rep_gross = run_fusion_replay(con, fee_rate=0.0, **common)  # type: ignore[arg-type]
+        rep = run_fusion_replay(con, fee_rate=args.fee_rate, **common)
+        rep_gross = run_fusion_replay(con, fee_rate=0.0, **common)
+        if args.gate == "ev":
+            # L1: fit the Platt calibrator on L0's settled fills (IN-SAMPLE — smoke
+            # test only, see calibration.py), then re-run gated on +EV vs the fee.
+            from backtest.calibration import ev_gate, fit_platt
+
+            samples = [
+                (float(t["p_side"]), 1.0 if t["won"] else 0.0) for t in rep.settled
+            ]
+            a, b = fit_platt(samples)
+            coeffs = (a, b)
+            gate = ev_gate(a, b, args.fee_rate)
+            rep_l1 = run_fusion_replay(
+                con, fee_rate=args.fee_rate, gate_fn=gate, **common
+            )
+            rep_l1_gross = run_fusion_replay(con, fee_rate=0.0, gate_fn=gate, **common)
     finally:
         con.close()
-
-    s, s0 = rep.summary(), rep_gross.summary()
-    # Per-direction split (favorite was YES for UP, NO for DOWN).
-    strat: dict[str, list[float]] = {"UP": [0, 0, 0.0], "DOWN": [0, 0, 0.0]}
-    for t in rep.settled:
-        d = str(t["direction"])
-        strat[d][1] += 1
-        strat[d][0] += 1 if t["won"] else 0
-        strat[d][2] += t["pnl"]
 
     def pct(w: float, n: float) -> str:
         return f"{w / n:.0%}" if n else "n/a"
 
+    def stats_block(
+        title: str, r: FusionReplayReport, r_gross: FusionReplayReport
+    ) -> None:
+        s, s0 = r.summary(), r_gross.summary()
+        strat: dict[str, list[float]] = {"UP": [0, 0, 0.0], "DOWN": [0, 0, 0.0]}
+        for t in r.settled:
+            d = str(t["direction"])
+            strat[d][1] += 1
+            strat[d][0] += 1 if t["won"] else 0
+            strat[d][2] += t["pnl"]
+        print(f"[{title}]")
+        print(
+            f"  Mercados         : {s['markets_total']}  "
+            f"(deadband-skip: {s['deadband_skip']}, gate-skip: {s['gate_skip']}, "
+            f"sem book: {s['unfilled_no_data']}, sem liquidez: {s['unfilled_no_liquidity']})"
+        )
+        if s["settled"]:
+            print(
+                f"  Resolvidos       : {s['settled']} -> {s['wins']} WIN / "
+                f"{s['settled'] - s['wins']} LOSS ({s['win_rate']:.0%})"
+            )
+            for d in ("UP", "DOWN"):
+                w, n, pnl = strat[d]
+                print(
+                    f"    {d:4}: {int(n)} trades | {int(w)} WIN | {pct(w, n)} | PnL ${pnl:+.2f}"
+                )
+            print(
+                f"  PnL com fee      : ${s['total_pnl']:+.2f} sobre ${s['total_staked']:.2f} "
+                f"| slip {s['avg_slippage_bps']:.0f} bps"
+            )
+            print(
+                f"  PnL sem fee      : ${s0['total_pnl']:+.2f}  (fee custou "
+                f"${s0['total_pnl'] - s['total_pnl']:+.2f})"
+            )
+        else:
+            print("  (nenhum mercado resolvido na janela)")
+
     line = "=" * 70
     print(line)
-    print("FUSION REPLAY — late-window favorite-follower (L0 baseline)")
+    print("FUSION REPLAY — late-window favorite-follower")
     print(line)
     print(
         f"Período : {datetime.fromtimestamp(start, tz=UTC):%Y-%m-%d %H:%M} -> "
@@ -564,37 +610,35 @@ def cmd_fusion_replay(args: argparse.Namespace) -> int:
         f"| fee={args.fee_rate:.2f}"
     )
     print("-" * 70)
-    print(
-        f"  Mercados         : {s['markets_total']}  "
-        f"(deadband-skip: {s['deadband_skip']}, sem book: {s['unfilled_no_data']}, "
-        f"sem liquidez: {s['unfilled_no_liquidity']})"
-    )
-    if s["settled"]:
+    stats_block("L0 — sempre a favorita", rep, rep_gross)
+
+    if coeffs is not None and rep_l1 is not None and rep_l1_gross is not None:
+        from backtest.calibration import platt_prob
+        from tv_market_select import fee_breakeven_prob
+
+        a, b = coeffs
+        print("-" * 70)
         print(
-            f"  Resolvidos       : {s['settled']} -> {s['wins']} WIN / "
-            f"{s['settled'] - s['wins']} LOSS ({s['win_rate']:.0%})"
+            "  [AVISO] SMOKE TEST: calibrador Platt ajustado IN-SAMPLE (mesmos dados) - "
+            "sanity de pipeline, NAO edge out-of-sample (validacao CPCV e o proximo passo)."
         )
-        for d in ("UP", "DOWN"):
-            w, n, pnl = strat[d]
+        print(f"  Platt: P(win) = sigmoid({a:+.3f}*p + {b:+.3f})")
+        print(f"  {'p_side':>7} {'P_cal':>7} {'breakeven':>10} {'decisão':>9}")
+        for p in (0.50, 0.60, 0.70, 0.80):
+            pc = platt_prob(a, b, p)
+            be = fee_breakeven_prob(p, args.fee_rate)
             print(
-                f"    {d:4}: {int(n)} trades | {int(w)} WIN | {pct(w, n)} | PnL ${pnl:+.2f}"
+                f"  {p:>7.2f} {pc:>7.2f} {be:>10.2f} "
+                f"{'TRADE' if pc > be else 'skip':>9}"
             )
-        print(
-            f"  PnL com fee      : ${s['total_pnl']:+.2f} sobre ${s['total_staked']:.2f} "
-            f"| slip {s['avg_slippage_bps']:.0f} bps"
-        )
-        print(
-            f"  PnL sem fee      : ${s0['total_pnl']:+.2f}  (fee custou "
-            f"${s0['total_pnl'] - s['total_pnl']:+.2f})"
-        )
-    else:
-        print("  (nenhum mercado resolvido na janela)")
+        print("-" * 70)
+        stats_block("L1 — gate de EV (Platt, in-sample)", rep_l1, rep_l1_gross)
     print(line)
 
     if args.out_csv and rep.trades:
         from backtest.engine import trades_dataframe
 
-        trades_dataframe(rep).to_csv(args.out_csv, index=False)
+        trades_dataframe(rep_l1 or rep).to_csv(args.out_csv, index=False)
         print(f"Trades written to {args.out_csv}")
     return 0
 
@@ -737,6 +781,13 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.40,
         help="buy NO when the UP mid is below this (default 0.40); deadband between = skip",
+    )
+    p_fusion.add_argument(
+        "--gate",
+        choices=["none", "ev"],
+        default="none",
+        help="none = L0 baseline; ev = L1 Platt-calibrated +EV gate "
+        "(fit IN-SAMPLE for a smoke test, prints L0 vs L1)",
     )
     p_fusion.add_argument("--out-csv", help="optional path to dump per-trade rows")
 

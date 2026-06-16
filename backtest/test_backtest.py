@@ -553,6 +553,35 @@ def test_fusion_replay():
     con.close()
 
 
+def test_calibration():
+    print("\n11. Platt calibrator + EV gate (L1)")
+    from backtest.calibration import ev_gate, fit_platt, platt_prob
+
+    # Separable-ish training data: favorites above 0.60 win, below lose.
+    samples = [(x / 100.0, 1.0 if x > 60 else 0.0) for x in range(40, 96, 5)]
+    a, b = fit_platt(samples)
+    check("positive slope (higher price -> higher P_win)", a > 0)
+    check(
+        "calibrated prob monotonic (0.80 > 0.50)",
+        platt_prob(a, b, 0.80) > platt_prob(a, b, 0.50),
+    )
+    check("prob stays in (0,1)", 0.0 < platt_prob(a, b, 0.80) < 1.0)
+
+    # Degenerate: all wins -> ridge keeps coefficients finite, no overflow/NaN.
+    a2, b2 = fit_platt([(0.7, 1.0), (0.8, 1.0), (0.9, 1.0)])
+    p2 = platt_prob(a2, b2, 0.8)
+    check("all-wins data: finite prob", 0.0 < p2 < 1.0)
+    check("empty data -> (0,0)", fit_platt([]) == (0.0, 0.0))
+
+    # EV gate with a hand-set steep sigmoid (deterministic): trade only when the
+    # calibrated win-prob beats the fee-adjusted breakeven.
+    gate = ev_gate(20.0, -13.0, fee_rate=0.07)
+    # p=0.80: P_cal=sigmoid(3)=0.953 > breakeven(0.80)=0.811 -> TRADE
+    check("strong favorite passes the EV gate", gate("UP", 0.80) is True)
+    # p=0.55: P_cal=sigmoid(-2)=0.119 < breakeven(0.55)=0.568 -> skip
+    check("thin favorite is gated out", gate("DOWN", 0.55) is False)
+
+
 def main() -> int:
     print("=" * 60)
     print("BACKTEST REPLAY ENGINE - TESTS")
@@ -568,6 +597,7 @@ def main() -> int:
     test_bot_trades()
     test_z_mom_ingest()
     test_fusion_replay()
+    test_calibration()
 
     print("\n" + "=" * 60)
     print(f"RESULT: {PASSED} passed, {FAILED} failed")
