@@ -73,6 +73,7 @@ paper_trades.json
 tv_dry_run_trades.json
 trades.json
 trade_history.json
+tv_stuck_queue_*.json
 *.trade
 
 # Logs (can contain sensitive info)
