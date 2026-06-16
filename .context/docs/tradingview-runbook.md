@@ -70,6 +70,41 @@ these to audit after the window scrolls — e.g. `Pre-subscribed NEXT market`, `
 (MARKET_BUY_USD)`, market selection, and errors. These are **operational** logs, separate from `backtest.db`
 (the recorder's structured store). `logs/` and `*.log` are gitignored.
 
+### 2.1 Redis Resilience (Self-Healing Consumer)
+
+The bot's webhook consumer tolerates Redis being unavailable — at boot or mid-run — instead of degrading
+permanently. (The 2026-06-16 incident: Redis went down during one of the 90-minute restarts, `init_redis()`
+returned `None`, and the consumer never came back until a manual restart — even after Redis recovered.) Three
+layers now cover it:
+
+- **Bounded boot retry.** `init_redis` retries on startup (`REDIS_CONNECT_RETRIES` × `REDIS_CONNECT_RETRY_DELAY`,
+  default 5 × 3s ≈ 12s), so a Redis still coming up (e.g. WSL just restarted) isn't missed. This stays well within
+  the supervisor's `BOT_STARTUP_TIMEOUT_S` (default 120s).
+- **Self-healing consumer.** The consumer thread **always starts** and reconnects from inside its own loop: if
+  `redis_client` is `None` (Redis down at boot) or a `BLPOP` fails (connection dropped at runtime), it retries
+  every `REDIS_RECONNECT_SECONDS` (default 5s) via the pure `redis_resilience.ensure_client`, instead of exiting.
+  A healthy boot logs `TradingView webhook consumer started (… self-healing Redis)`; a recovery logs
+  `Redis connection established`.
+- **One-shot mode re-force.** If the boot-time `simulation_mode` write was skipped because Redis was down, the
+  consumer re-applies the session's sim/live mode (the mode the bot was **launched** with — `--live`,
+  `--test-mode`, or sim) **once** on its first reconnect (`Redis recovered — session mode re-forced to …`), so a
+  stale value from a previous run can't silently take over. You can't change the mode via `redis_control.py`
+  while Redis is down (it has nothing to write to), so this re-force has nothing of yours to clobber; once it has
+  fired, any later `redis_control.py` change is respected across reconnect blips.
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `REDIS_CONNECT_RETRIES` | `5` | Boot connection attempts before `init_redis` gives up |
+| `REDIS_CONNECT_RETRY_DELAY` | `3` | Seconds between boot attempts |
+| `REDIS_RECONNECT_SECONDS` | `5` | Consumer back-off between runtime reconnect attempts |
+
+Two boundaries to keep in mind:
+- The **receiver** ([tradingview_webhook_receiver.py](../../tradingview_webhook_receiver.py)) is unchanged — it
+  still **exits at startup** if Redis is unreachable (§7), since it is a separate process with no node to keep alive.
+- This is **distinct from the startup watchdog** (§7, [architecture.md](architecture.md)): the watchdog recovers a
+  boot that hangs *inside* `node.run()`; the self-healing consumer recovers a *Redis* outage on an otherwise-healthy
+  boot. Different failure modes, both covered.
+
 ## 3. First-Time Setup
 
 1. **Set the secret** in `.env`: `TRADINGVIEW_WEBHOOK_SECRET=<48+ random chars>`. Never reuse it elsewhere;
@@ -268,7 +303,7 @@ each arriving signal but logs `IGNORED — fusion strategy active` instead of tr
 | Alert returns `403 forbidden` | Secret in alert JSON ≠ `.env` secret | Fix the alert message; never log/echo the secret |
 | Alert returns `400 invalid JSON` / `invalid signal` | Alert message isn't the exact JSON, or signal ≠ UP/DOWN | Copy the JSON template from §3 verbatim |
 | Alert returns 200 but bot does nothing | Bot not running, or strategy ≠ `tradingview` | `redis_control.py status`; start bot; `strategy tradingview` |
-| Alert returns 200, `LLEN btc_trading:tradingview_signals` stays > 0, no trade | Webhook consumer never started — bot booted "skewed" (`redis_client` came up None, or stuck in `_load_all_btc_instruments`). The consumer launches inside `on_start`, only after the live node reaches RUNNING + a 10s post-reconciliation delay | Restart `bot.py`; a healthy boot logs `TradingView webhook consumer started (BLPOP...)` and the queue drains within seconds |
+| Alert returns 200, `LLEN btc_trading:tradingview_signals` stays > 0, no trade | The consumer now **self-heals** a Redis outage (reconnects every `REDIS_RECONNECT_SECONDS`, default 5s, whether Redis was down at boot or dropped at runtime — see §2.1), so a stuck queue is rarely Redis. Likely causes: `strategy ≠ tradingview` (signals are drained and logged `IGNORED — fusion strategy active`), or a non-Redis boot hang (the consumer launches inside `on_start`, after the live node reaches RUNNING + a 10s post-reconciliation delay) | `redis_control.py status`. If Redis was down, **wait ~5–15s** — the consumer reconnects on its own, no manual restart; a healthy/recovered consumer logs `TradingView webhook consumer started (… self-healing Redis)` then `Redis connection established`, and the queue drains within seconds. Restart `bot.py` only if the queue stays stuck with Redis up and `strategy tradingview` |
 | Bot log stops after `Nautilus node built successfully`, `Strategy active` **never** logs, `LLEN` keeps growing for minutes, process alive but frozen | `node.run()` hung connecting the Polymarket client *before* `on_start` ran (intermittent connect stall) — the worst case, since the bot's own 90-min self-restart never arms either. Distinct from the row above, where the node *did* reach RUNNING but only the consumer failed to start | **Don't restart manually** — the supervisor's **startup watchdog** auto-recovers: no `Strategy active` within `BOT_STARTUP_TIMEOUT_S` (set in `.env`, default 120s) → it kills the process tree and relaunches. Allow **~2–3 min** (timeout + a fresh boot). Raise `BOT_STARTUP_TIMEOUT_S` only if boots are legitimately slower, then restart the supervisor to apply. If it recurs, `uv pip install py-spy` and `py-spy dump --pid <bot.py child PID>` (the runner's `python bot.py` subprocess, **not** the supervisor) — a MainThread parked in `node.run` confirms it |
 | Bot log at startup: `PolyApiException[status_code=401 ... Unauthorized/Invalid api key]` | Polymarket API credentials in `.env` are invalid/expired | **Dry run is unaffected** (`submit_order` is skipped); regenerate `POLYMARKET_API_KEY`/`SECRET`/`PASSPHRASE` **before going live**, or real orders fail with 401 |
 | Bot log: `IGNORED — fusion strategy active` | `btc_trading:active_strategy` is `fusion` | `uv run python redis_control.py strategy tradingview` |

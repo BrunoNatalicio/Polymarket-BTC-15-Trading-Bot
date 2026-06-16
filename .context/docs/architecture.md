@@ -143,6 +143,11 @@ On each cycle the strategy either runs the fusion path (combine signals -> fuse 
   restarts.
 - **Dry run reuses the full live order path** (`_place_real_order(dry_run=True)`) with `submit_order` as the only
   skipped call, to guarantee 100% fidelity between dry-run and live behavior for TradingView trades.
+- **Self-healing Redis consumer** over a fail-once client: the webhook consumer reconnects on every loop via the
+  dependency-free `redis_resilience.ensure_client` (same pure-module pattern as `tv_market_select`), so a Redis
+  outage at boot or runtime can't leave the bot permanently unable to process webhooks (the 2026-06-16 incident).
+  The startup watchdog (which kills a `node.run()` hang) is deliberately *not* extended to Redis health — the
+  consumer's own reconnect makes a process kill redundant for that failure mode.
 
 ## Risks & Constraints
 
@@ -151,8 +156,10 @@ On each cycle the strategy either runs the fusion path (combine signals -> fuse 
   latency-sensitive.
 - Max 1 trade per 15-minute market (`btc_trading:tv_last_traded_market`), persisted across the 90-minute
   auto-restart.
-- The bot depends on Redis being reachable (WSL-hosted); if Redis is down, runtime mode polling and the
-  TradingView queue both fail.
+- The bot depends on Redis being reachable (WSL-hosted); if Redis is down, runtime mode polling falls back to the
+  static `.env` default, but the **TradingView webhook consumer self-heals** — it reconnects from inside its loop
+  (Redis down at boot or dropped at runtime) via the pure `redis_resilience.ensure_client`, rather than degrading
+  permanently (the 2026-06-16 incident). The separate webhook *receiver* process still requires Redis at startup.
 
 ## Top Directories Snapshot
 

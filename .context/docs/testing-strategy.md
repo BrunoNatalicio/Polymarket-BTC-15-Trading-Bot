@@ -26,13 +26,18 @@ via `ruff` (lint/format) and `pyright` (type checking). New phases or modules sh
   - [execution/test_execution.py](../../execution/test_execution.py) - `test_risk_engine`,
     `test_execution_engine`, `test_polymarket_client`, `run_all_tests`, `test`
   - [test_tradingview_webhook.py](../../test_tradingview_webhook.py) - `test_parse_alert`,
-    `test_validate_secret`, `test_staleness`, `test_direction_mapping`, `test_redis_roundtrip`,
-    `test_http_end_to_end`, uses `StubRedis` to avoid a real Redis dependency
+    `test_validate_secret`, `test_staleness`, `test_direction_mapping`, `test_redis_resilience`,
+    `test_redis_roundtrip`, `test_http_end_to_end`, uses `StubRedis` to avoid a real Redis dependency
 - **Integration-style checks**: `execution/test_execution.py::run_all_tests` and
   `test_tradingview_webhook.py::test_http_end_to_end` exercise multiple components together (e.g. a real HTTP
   request against `WebhookHandler`).
 - **No E2E harness against live Polymarket** - live-path validation is done via `--test-mode` (simulated trades)
   and `dryrun on` (full live order path with `submit_order` skipped).
+- **Opt-in integration script**: [test_redis_resilience_integration.py](../../test_redis_resilience_integration.py)
+  drives the real `redis_resilience.ensure_client` through a full Redis down→up cycle. For safety it spins up an
+  **isolated** `redis-server` on port 6399 inside WSL and kills/restarts *that* - it never touches the production
+  Redis on `:6379`. Not part of the commit gate (it needs WSL); it skips cleanly (exit 0) when WSL/redis-server is
+  unavailable. Run: `uv run python test_redis_resilience_integration.py`.
 
 ## Running Tests
 
