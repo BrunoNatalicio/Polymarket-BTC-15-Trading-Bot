@@ -226,6 +226,7 @@ def run_replay(
                 "direction": direction,
                 "market_slug": row["market_slug"],
                 "token_id": str(row["token_id"]),
+                "p_side": p_side,
                 "snapshot_age_s": float(row["snapshot_age_s"]),
                 "best_quote": fill.best_quote,
                 "vwap": fill.vwap,

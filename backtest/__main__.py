@@ -514,6 +514,31 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_loss_postmortem(args: argparse.Namespace) -> int:
+    from backtest.loss_postmortem import run_loss_postmortem
+
+    start = _parse_when(args.start) if args.start else 0.0
+    end = _parse_when(args.end) if args.end else time.time()
+    con = db.connect()
+    try:
+        from backtest.settlement import settle_backfill
+
+        settle_backfill(con)
+        run_loss_postmortem(
+            con,
+            start_ts=start,
+            end_ts=end,
+            stake_usd=args.stake,
+            fee_rate=args.fee_rate,
+            series=args.series,
+            source_like=args.signal_source,
+            gate_floor=args.gate_floor,
+        )
+    finally:
+        con.close()
+    return 0
+
+
 def cmd_fusion_replay(args: argparse.Namespace) -> int:
     from backtest.fusion_replay import FusionReplayReport, run_fusion_replay
     from backtest.settlement import settle_backfill
@@ -832,6 +857,23 @@ def main(argv: list[str] | None = None) -> int:
         "(live-aligned close source); takes precedence over --closes-csv",
     )
 
+    p_pm = sub.add_parser(
+        "loss-postmortem",
+        help="slice the strategy's LOSSES by prob/direction/session/momentum/slippage",
+    )
+    p_pm.add_argument("--start", help="ISO date/datetime or unix seconds")
+    p_pm.add_argument("--end", help="ISO date/datetime or unix seconds")
+    p_pm.add_argument("--series", choices=["15m", "5m"], default="15m")
+    p_pm.add_argument("--signal-source", default="tradingview")
+    p_pm.add_argument("--stake", type=float, default=3.0)
+    p_pm.add_argument("--fee-rate", type=float, default=0.07)
+    p_pm.add_argument(
+        "--gate-floor",
+        type=float,
+        default=0.42,
+        help="live book-agreement floor, used to partition caught vs surviving losses",
+    )
+
     p_fusion = sub.add_parser(
         "fusion-replay",
         help="replay the fusion strategy (late-window favorite-follower) on recorded books",
@@ -920,6 +962,7 @@ def main(argv: list[str] | None = None) -> int:
         "import-signals": cmd_import_signals,
         "report": cmd_report,
         "tune": cmd_tune,
+        "loss-postmortem": cmd_loss_postmortem,
         "fusion-replay": cmd_fusion_replay,
         "fusion-cpcv": cmd_fusion_cpcv,
     }
