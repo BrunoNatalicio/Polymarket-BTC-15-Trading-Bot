@@ -647,6 +647,30 @@ def test_cpcv():
     check("aggregate has all paths", res2["n_paths"] == 5)
 
 
+def test_candidate_window_starts():
+    print("\n13. phase-robust 4h window discovery")
+    from backtest.recorder import candidate_window_starts
+
+    win_s = 14400  # 4h => 4 hour-phase candidates
+    # "now" 1h into the epoch-aligned window starting at 1782144000 (phase 0).
+    now = 1782144000 + 3600
+    cands = candidate_window_starts(win_s, now)
+    check("4h => 4 hour-aligned candidates", len(cands) == 4)
+    check("candidates are most-recent-first", cands == sorted(cands, reverse=True))
+    check("candidates are hour-aligned", all(c % 3600 == 0 for c in cands))
+    check(
+        "every candidate's window covers now", all(c <= now < c + win_s for c in cands)
+    )
+    check("epoch-aligned (phase 0) start is a candidate", 1782144000 in cands)
+
+    # Phase-shifted window (start % 14400 == 3600): still discoverable because we
+    # enumerate hour phases, not just the epoch-aligned one.
+    shifted_start = 1782144000 + 3600  # phase 3600
+    now2 = shifted_start + 7200  # 2h into the shifted window
+    cands2 = candidate_window_starts(win_s, now2)
+    check("phase-shifted start is among candidates", shifted_start in cands2)
+
+
 def main() -> int:
     print("=" * 60)
     print("BACKTEST REPLAY ENGINE - TESTS")
@@ -664,6 +688,7 @@ def main() -> int:
     test_fusion_replay()
     test_calibration()
     test_cpcv()
+    test_candidate_window_starts()
 
     print("\n" + "=" * 60)
     print(f"RESULT: {PASSED} passed, {FAILED} failed")

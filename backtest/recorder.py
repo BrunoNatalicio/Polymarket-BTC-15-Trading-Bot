@@ -34,11 +34,20 @@ enable_log_redaction()
 
 CLOB_BASE = "https://clob.polymarket.com"
 HTTP_TIMEOUT = 5.0
-# Polymarket BTC up/down recurring series: slug prefix -> window length (s).
+# Polymarket up/down recurring series: name -> (slug prefix, window length s,
+# poll cadence s). The 15m/5m btc series are epoch-aligned and polled densely;
+# the 4h multi-asset pool is phase-discovered (see candidate_window_starts) and
+# polled sparsely so a 4h window doesn't flood the DB (~960 snaps/window @ 15s).
 SERIES = {
-    "15m": ("btc-updown-15m-", 900),
-    "5m": ("btc-updown-5m-", 300),
+    "15m": ("btc-updown-15m-", 900, 2.0),
+    "5m": ("btc-updown-5m-", 300, 2.0),
+    "btc-4h": ("btc-updown-4h-", 14400, 15.0),
+    "eth-4h": ("eth-updown-4h-", 14400, 15.0),
+    "sol-4h": ("sol-updown-4h-", 14400, 15.0),
+    "xrp-4h": ("xrp-updown-4h-", 14400, 15.0),
 }
+HOUR_S = 3600
+PHASE_DISCOVERY_MIN_WINDOW_S = HOUR_S  # win_s >= this => probe-discover the phase
 PREFETCH_LEAD_S = 60  # fetch next market's tokens this long before rollover
 EXPIRY_GRACE_S = 30  # keep polling an expired market this long past its end
 TV_SIGNAL_LOG_KEY = "btc_trading:tv_signal_log"
@@ -83,6 +92,23 @@ def current_window_start(window_seconds: int, now: float | None = None) -> int:
     return ts - (ts % window_seconds)
 
 
+def candidate_window_starts(window_seconds: int, now: float | None = None) -> list[int]:
+    """Hour-aligned window starts that could contain ``now``, most recent first.
+
+    Polymarket's 4h up/down windows are 14400s, consecutive and non-overlapping,
+    but NOT stably epoch-aligned: the phase (``window_start % window_seconds``) can
+    shift by an hour after a gap. They always start on an hour boundary, though, so
+    the active window's start is one of the ``window_seconds // 3600`` hour marks at
+    or before ``now`` whose window still covers ``now``. The recorder probes these
+    against Gamma and tracks whichever resolves — phase-shift proof. Returns the
+    most-recent candidate first so the live window is found on the first probe.
+    """
+    ts = int(now if now is not None else time.time())
+    hour = ts - (ts % HOUR_S)
+    n = max(1, window_seconds // HOUR_S)
+    return [hour - k * HOUR_S for k in range(n)]
+
+
 class Recorder:
     def __init__(
         self,
@@ -95,15 +121,17 @@ class Recorder:
         self.poll_seconds = poll_seconds
         self.depth = depth
         self.series = [s for s in (series or list(SERIES)) if s in SERIES]
-        # slug -> {yes_token_id, no_token_id, window_start, window_end}
+        # slug -> {yes_token_id, no_token_id, window_start, window_end, poll_s}
         self.tracked: dict[str, dict[str, Any]] = {}
+        # slug -> last orderbook fetch time, for per-market poll cadence
+        self.last_polled: dict[str, float] = {}
         self.redis_client: redis.Redis | None = None
         self._next_redis_retry = 0.0
 
     # -- market tracking -----------------------------------------------------
 
     def _track_market(
-        self, prefix: str, window_start: int, window_seconds: int
+        self, prefix: str, window_start: int, window_seconds: int, poll_s: float
     ) -> None:
         import backtest.gamma as gamma  # late import keeps module load light
 
@@ -118,6 +146,7 @@ class Recorder:
             "no_token_id": tokens["no_token_id"],
             "window_start": window_start,
             "window_end": window_start + window_seconds,
+            "poll_s": poll_s,
         }
         self.tracked[slug] = info
         db.upsert_market(
@@ -133,12 +162,15 @@ class Recorder:
 
     def refresh_tracked_markets(self, now: float) -> None:
         for name in self.series:
-            prefix, win_s = SERIES[name]
-            start = current_window_start(win_s, now)
-            self._track_market(prefix, start, win_s)
-            lead = min(PREFETCH_LEAD_S, win_s // 3)
-            if now >= start + win_s - lead:
-                self._track_market(prefix, start + win_s, win_s)
+            prefix, win_s, poll_s = SERIES[name]
+            if win_s >= PHASE_DISCOVERY_MIN_WINDOW_S:
+                self._refresh_long_series(prefix, win_s, poll_s, now)
+            else:
+                start = current_window_start(win_s, now)
+                self._track_market(prefix, start, win_s, poll_s)
+                lead = min(PREFETCH_LEAD_S, win_s // 3)
+                if now >= start + win_s - lead:
+                    self._track_market(prefix, start + win_s, win_s, poll_s)
         expired = [
             slug
             for slug, info in self.tracked.items()
@@ -146,13 +178,44 @@ class Recorder:
         ]
         for slug in expired:
             del self.tracked[slug]
+            self.last_polled.pop(slug, None)
             logger.info(f"Stopped tracking expired market {slug}")
+
+    def _refresh_long_series(
+        self, prefix: str, win_s: int, poll_s: float, now: float
+    ) -> None:
+        """Track the active window for a phase-discovered (long) series.
+
+        Probes Gamma only at rollover: once the live window is tracked, the
+        wrong-phase candidates are never re-queried. Prefetches the next window
+        (start + win_s) just before rollover so the book is warm at the boundary.
+        """
+        active_start: int | None = next(
+            (
+                info["window_start"]
+                for slug, info in self.tracked.items()
+                if slug.startswith(prefix)
+                and info["window_start"] <= now < info["window_end"]
+            ),
+            None,
+        )
+        if active_start is None:
+            for cand in candidate_window_starts(win_s, now):
+                self._track_market(prefix, cand, win_s, poll_s)
+                if f"{prefix}{cand}" in self.tracked:
+                    active_start = cand
+                    break
+        if active_start is not None and now >= active_start + win_s - PREFETCH_LEAD_S:
+            self._track_market(prefix, active_start + win_s, win_s, poll_s)
 
     # -- orderbook polling ---------------------------------------------------
 
     def record_books(self, now: float) -> int:
         written = 0
         for slug, info in list(self.tracked.items()):
+            if now - self.last_polled.get(slug, 0.0) < info["poll_s"]:
+                continue  # per-market cadence: long windows poll sparsely
+            self.last_polled[slug] = now
             for side_label, token_key in (
                 ("YES", "yes_token_id"),
                 ("NO", "no_token_id"),
@@ -267,7 +330,9 @@ def main() -> int:
     depth = int(os.getenv("BACKTEST_BOOK_DEPTH", "20"))
     series = [
         s.strip()
-        for s in os.getenv("BACKTEST_SERIES", "15m,5m").split(",")
+        for s in os.getenv(
+            "BACKTEST_SERIES", "15m,5m,btc-4h,eth-4h,sol-4h,xrp-4h"
+        ).split(",")
         if s.strip()
     ]
     con = db.connect()
