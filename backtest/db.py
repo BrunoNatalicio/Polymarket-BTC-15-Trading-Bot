@@ -62,6 +62,31 @@ CREATE TABLE IF NOT EXISTS orderbook_levels (
     size        REAL NOT NULL,
     PRIMARY KEY (snapshot_id, side, level)
 ) WITHOUT ROWID;
+
+-- Spot (Binance) L2 depth, recorded for MLOFI / order-flow features. Prices are
+-- stored as REAL (not price_m thousandths): a $60k spot price is not in [0,1].
+CREATE TABLE IF NOT EXISTS spot_orderbook_snapshots (
+    snapshot_id    INTEGER PRIMARY KEY,
+    ts             REAL NOT NULL,
+    symbol         TEXT NOT NULL,
+    best_bid       REAL,
+    best_ask       REAL,
+    bid_depth_base REAL,
+    ask_depth_base REAL,
+    n_bid_levels   INTEGER NOT NULL,
+    n_ask_levels   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_spot_snap_sym_ts
+    ON spot_orderbook_snapshots(symbol, ts);
+
+CREATE TABLE IF NOT EXISTS spot_orderbook_levels (
+    snapshot_id INTEGER NOT NULL REFERENCES spot_orderbook_snapshots(snapshot_id),
+    side        TEXT NOT NULL CHECK (side IN ('bid','ask')),
+    level       INTEGER NOT NULL,
+    price       REAL NOT NULL,
+    size        REAL NOT NULL,
+    PRIMARY KEY (snapshot_id, side, level)
+) WITHOUT ROWID;
 """
 
 
@@ -193,6 +218,54 @@ def insert_snapshot(
     if rows:
         con.executemany(
             "INSERT INTO orderbook_levels (snapshot_id, side, level, price_m, size) "
+            "VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+    con.commit()
+    return snapshot_id
+
+
+def insert_spot_snapshot(
+    con: sqlite3.Connection,
+    ts: float,
+    symbol: str,
+    bids: list[tuple[float, float]],
+    asks: list[tuple[float, float]],
+) -> int:
+    """Persist one Binance spot L2 snapshot with its levels (REAL prices).
+
+    Mirrors ``insert_snapshot`` but for the underlying spot book: prices are kept
+    as REAL (a $60k price isn't a [0,1] probability). ``bids``/``asks`` must be
+    normalized best-first (bids descending, asks ascending) and depth-capped.
+    """
+    bid_depth = sum(s for _, s in bids)
+    ask_depth = sum(s for _, s in asks)
+    cur = con.execute(
+        """
+        INSERT INTO spot_orderbook_snapshots
+            (ts, symbol, best_bid, best_ask, bid_depth_base, ask_depth_base,
+             n_bid_levels, n_ask_levels)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ts,
+            symbol,
+            bids[0][0] if bids else None,
+            asks[0][0] if asks else None,
+            bid_depth,
+            ask_depth,
+            len(bids),
+            len(asks),
+        ),
+    )
+    snapshot_id = cur.lastrowid
+    assert snapshot_id is not None
+    rows = [(snapshot_id, "bid", i, p, s) for i, (p, s) in enumerate(bids)] + [
+        (snapshot_id, "ask", i, p, s) for i, (p, s) in enumerate(asks)
+    ]
+    if rows:
+        con.executemany(
+            "INSERT INTO spot_orderbook_levels (snapshot_id, side, level, price, size) "
             "VALUES (?, ?, ?, ?, ?)",
             rows,
         )

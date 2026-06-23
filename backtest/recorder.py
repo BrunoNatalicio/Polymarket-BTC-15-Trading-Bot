@@ -33,6 +33,7 @@ from log_setup import enable_log_redaction  # noqa: E402
 enable_log_redaction()
 
 CLOB_BASE = "https://clob.polymarket.com"
+BINANCE_BASE = "https://api.binance.com"
 HTTP_TIMEOUT = 5.0
 # Polymarket up/down recurring series: name -> (slug prefix, window length s,
 # poll cadence s). The 15m/5m btc series are epoch-aligned and polled densely;
@@ -64,6 +65,42 @@ def fetch_book(token_id: str) -> dict[str, Any] | None:
     except Exception as e:
         logger.warning(f"Book fetch failed for {token_id[:16]}…: {e}")
         return None
+
+
+def fetch_spot_depth(symbol: str, limit: int) -> dict[str, Any] | None:
+    """Fetch one Binance spot L2 depth snapshot (same sync-httpx pattern)."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            resp = client.get(
+                f"{BINANCE_BASE}/api/v3/depth",
+                params={"symbol": symbol, "limit": limit},
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.warning(f"Spot depth fetch failed for {symbol}: {e}")
+        return None
+
+
+def normalize_pairs(
+    raw_levels: list[list[Any]], *, descending: bool, depth: int
+) -> list[tuple[float, float]]:
+    """Convert Binance [price, qty] string pairs to (price, size) best-first.
+
+    Binance already returns bids descending / asks ascending, but re-sort to be
+    safe and depth-cap (mirrors ``normalize_levels`` for the dict-shaped CLOB).
+    """
+    parsed: list[tuple[float, float]] = []
+    for level in raw_levels:
+        try:
+            price = float(level[0])
+            size = float(level[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if price > 0 and size > 0:
+            parsed.append((price, size))
+    parsed.sort(key=lambda ps: ps[0], reverse=descending)
+    return parsed[:depth]
 
 
 def normalize_levels(
@@ -116,6 +153,9 @@ class Recorder:
         poll_seconds: float,
         depth: int,
         series: list[str] | None = None,
+        spot_symbols: list[str] | None = None,
+        spot_depth: int = 10,
+        spot_poll_seconds: float | None = None,
     ):
         self.con = con
         self.poll_seconds = poll_seconds
@@ -125,6 +165,13 @@ class Recorder:
         self.tracked: dict[str, dict[str, Any]] = {}
         # slug -> last orderbook fetch time, for per-market poll cadence
         self.last_polled: dict[str, float] = {}
+        # spot (Binance) L2 collection for MLOFI/order-flow features
+        self.spot_symbols = spot_symbols or []
+        self.spot_depth = spot_depth
+        self.spot_poll_seconds = (
+            spot_poll_seconds if spot_poll_seconds is not None else poll_seconds
+        )
+        self.last_spot_polled: dict[str, float] = {}
         self.redis_client: redis.Redis | None = None
         self._next_redis_retry = 0.0
 
@@ -241,6 +288,32 @@ class Recorder:
                 written += 1
         return written
 
+    # -- spot depth polling --------------------------------------------------
+
+    def record_spot(self, now: float) -> int:
+        """Poll each configured Binance symbol's L2 depth into the spot tables."""
+        written = 0
+        for symbol in self.spot_symbols:
+            if now - self.last_spot_polled.get(symbol, 0.0) < self.spot_poll_seconds:
+                continue
+            self.last_spot_polled[symbol] = now
+            book = fetch_spot_depth(symbol, self.spot_depth)
+            if book is None:
+                continue
+            bids = normalize_pairs(
+                book.get("bids") or [], descending=True, depth=self.spot_depth
+            )
+            asks = normalize_pairs(
+                book.get("asks") or [], descending=False, depth=self.spot_depth
+            )
+            if not bids and not asks:
+                continue
+            db.insert_spot_snapshot(
+                self.con, ts=now, symbol=symbol, bids=bids, asks=asks
+            )
+            written += 1
+        return written
+
     # -- signal tap ----------------------------------------------------------
 
     def _get_redis(self) -> redis.Redis | None:
@@ -304,14 +377,17 @@ class Recorder:
     # -- main loop -----------------------------------------------------------
 
     def run_forever(self) -> None:
+        spot = ",".join(self.spot_symbols) if self.spot_symbols else "off"
         logger.info(
             f"Recorder started: poll={self.poll_seconds}s depth={self.depth} "
+            f"spot=[{spot}]@{self.spot_poll_seconds}s/{self.spot_depth}lvl "
             f"db={os.getenv('BACKTEST_DB_PATH', db.DEFAULT_DB_PATH)}"
         )
         while True:
             tick_start = time.time()
             self.refresh_tracked_markets(tick_start)
             snaps = self.record_books(tick_start)
+            self.record_spot(tick_start)
             sigs = self.drain_signals()
             if sigs:
                 logger.info(f"Tapped {sigs} new signal(s)")
@@ -335,8 +411,26 @@ def main() -> int:
         ).split(",")
         if s.strip()
     ]
+    # Spot L2 collection (Binance) for MLOFI; empty BACKTEST_SPOT_SYMBOLS = off.
+    spot_symbols = [
+        s.strip().upper()
+        for s in os.getenv("BACKTEST_SPOT_SYMBOLS", "BTCUSDT").split(",")
+        if s.strip()
+    ]
+    spot_depth = int(os.getenv("BACKTEST_SPOT_DEPTH", "10"))
+    spot_poll_seconds = float(
+        os.getenv("BACKTEST_SPOT_POLL_SECONDS", str(poll_seconds))
+    )
     con = db.connect()
-    recorder = Recorder(con, poll_seconds=poll_seconds, depth=depth, series=series)
+    recorder = Recorder(
+        con,
+        poll_seconds=poll_seconds,
+        depth=depth,
+        series=series,
+        spot_symbols=spot_symbols,
+        spot_depth=spot_depth,
+        spot_poll_seconds=spot_poll_seconds,
+    )
     try:
         recorder.run_forever()
     except KeyboardInterrupt:

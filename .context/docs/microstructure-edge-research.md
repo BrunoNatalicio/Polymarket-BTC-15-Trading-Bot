@@ -170,6 +170,10 @@ Os **negritos** aparecem nos dois relatórios ou casam diretamente com a tese fu
    sobrevive causalmente** (CPCV NO GAIN); confound do proxy não-causal. Manter L0.
 2. ~~Avaliar **Resolved Markets API**~~ ✅ **FEITO (§7)** — veredito GO p/ trial free.
 3. Backtest **MLOFI vs sinais atuais** sob CPCV + Deflated Sharpe + custos reais.
+   🛠️ **Coletor de L2 da Binance EM OPERAÇÃO (2026-06-23)** — o recorder agora grava o book
+   spot (`spot_orderbook_snapshots`/`_levels`, REAL; default `BTCUSDT`, 10 níveis, ~tick;
+   env `BACKTEST_SPOT_*`). Destrava o MLOFI; **reiniciar `backtest record` p/ ativar** e
+   acumular semanas de dados antes do backtest.
 4. Priorizar setups **4h cross-asset** (#2, #3, #4) pela tese de generalização.
 5. ~~gate **invertido** (baixa-vol) OOS~~ ✅ **FEITO/REPROVADO (§2)** — NO GAIN também;
    linha de volatilidade encerrada (nenhuma direção bate o L0 OOS).
