@@ -558,6 +558,32 @@ def cmd_loss_postmortem(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bias(args: argparse.Namespace) -> int:
+    from backtest.bias_scan import SERIES_SPEC, run_bias_scan
+    from backtest.settlement import settle_backfill
+
+    start = _parse_when(args.start) if args.start else 0.0
+    end = _parse_when(args.end) if args.end else time.time()
+    series_list = [args.series] if args.series else list(SERIES_SPEC)
+    con = db.connect()
+    try:
+        settle_backfill(con)
+        for series in series_list:
+            run_bias_scan(
+                con,
+                start_ts=start,
+                end_ts=end,
+                series=series,
+                fee_rate=args.fee_rate,
+                stake_usd=args.stake,
+                ref_seconds=args.ref_seconds,
+                sweep=not args.no_sweep,
+            )
+    finally:
+        con.close()
+    return 0
+
+
 def cmd_fusion_replay(args: argparse.Namespace) -> int:
     from backtest.fusion_replay import FusionReplayReport, run_fusion_replay
     from backtest.settlement import settle_backfill
@@ -929,6 +955,34 @@ def main(argv: list[str] | None = None) -> int:
         help="live book-agreement floor, used to partition caught vs surviving losses",
     )
 
+    p_bias = sub.add_parser(
+        "bias",
+        help="structural Yes-Bias scan: calibration + symmetric YES/NO EV over "
+        "EVERY recorded market (no signal filter)",
+    )
+    p_bias.add_argument("--start", help="ISO date/datetime or unix seconds")
+    p_bias.add_argument("--end", help="ISO date/datetime or unix seconds")
+    p_bias.add_argument(
+        "--series",
+        choices=["15m", "5m", "4h"],
+        default=None,
+        help="series to scan; omit to run all three (btc 15m, 5m, 4h)",
+    )
+    p_bias.add_argument("--stake", type=float, default=3.0)
+    p_bias.add_argument("--fee-rate", type=float, default=0.07)
+    p_bias.add_argument(
+        "--ref-seconds",
+        type=int,
+        default=None,
+        help="seconds into the window to read the YES mid (default: near-close "
+        "per series); the EV test and cuts use this reference",
+    )
+    p_bias.add_argument(
+        "--no-sweep",
+        action="store_true",
+        help="skip the time-to-expiry calibration sweep (only the primary ref)",
+    )
+
     p_fusion = sub.add_parser(
         "fusion-replay",
         help="replay the fusion strategy (late-window favorite-follower) on recorded books",
@@ -1036,6 +1090,7 @@ def main(argv: list[str] | None = None) -> int:
         "report": cmd_report,
         "tune": cmd_tune,
         "loss-postmortem": cmd_loss_postmortem,
+        "bias": cmd_bias,
         "fusion-replay": cmd_fusion_replay,
         "fusion-cpcv": cmd_fusion_cpcv,
         "guppy-parity": cmd_guppy_parity,

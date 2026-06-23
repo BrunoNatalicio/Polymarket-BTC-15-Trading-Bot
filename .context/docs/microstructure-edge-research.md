@@ -1,7 +1,7 @@
 ---
 type: doc
 name: microstructure-edge-research
-description: Síntese de dois relatórios de deep research sobre microestrutura e extração de edge em mercados de previsão de curtíssimo prazo (Polymarket/Kalshi) — convergências de alta confiança, a contradição FLB×Yes-Bias, descobertas novas (Resolved Markets L2 API, Tick Rule enviesada), pool de 12 setups testáveis e implicações pro código fusion
+description: Síntese de dois relatórios de deep research sobre microestrutura e extração de edge em mercados de previsão de curtíssimo prazo (Polymarket/Kalshi) — convergências de alta confiança, a contradição FLB×Yes-Bias RESOLVIDA pelo scan estrutural (sem Yes-Bias direcional; o lever é regime de volatilidade — `backtest bias`), memo de avaliação da Resolved Markets API (GO trial free), descobertas (Tick Rule enviesada), pool de 12 setups e implicações pro código fusion
 category: reference
 generated: 2026-06-23
 status: filled
@@ -59,9 +59,29 @@ Os relatórios **discordam sobre o lado DOWN/NO** — e isso colide com nosso pr
   `tv-up-validated-down-dropped` dropou DOWN por timing/conviction, não por viés
   estrutural.
 
-→ **Ponto em aberto a validar com dados nossos:** o DOWN-fraco que observamos é (a) Yes
-Bias estrutural, (b) artefato de execução/timing, ou (c) ruído de amostra pequena?
-Testar com L2 histórico antes de assumir qualquer lado.
+→ **RESOLVIDO (2026-06-23) — não há Yes Bias direcional nos nossos books.** Scan
+estrutural sobre TODO mercado gravado (sem filtro de sinal), via
+`uv run python -m backtest bias` (`backtest/bias_scan.py`), ref near-close:
+
+- **Calibração** quase sem viés direcional: 15m gap global ≈ **−0.012** (YES levemente
+  caro); 5m gap ≈ **+0.01** (YES levemente *barato* — sinal oposto). Nenhum dos dois é o
+  Yes-Bias forte que R1 previu, e os sinais se cancelam entre timeframes.
+- **EV simétrico (o discriminante):** é **FLB simétrico**, não direcional. Comprar o lado
+  *longshot* (qualquer que seja) sangra; comprar a favorita fica ~breakeven. Total
+  comprar-YES vs comprar-NO: **15m −23,6% vs −21,2%** (≈simétrico); **5m −8,2% vs
+  −16,0%** (se algo, favorece UP/YES). Em **nenhum** timeframe comprar NO/DOWN é o lado
+  +EV que os relatórios previam.
+- **Veredito:** confirma o `tv-loss-postmortem-findings` — **DOWN não é estruturalmente
+  fraco**; o "Yes Bias" de R1 **não replica** nos nossos 15m/5m. (4h: só 7 mercados BTC
+  resolvidos — amostra vazia, reavaliar quando o recorder acumular.)
+
+→ **Achado-bônus, mais forte que a pergunta:** o corte por **volatilidade** é o que
+manda. O **tercil de alta-vol é o ÚNICO regime +EV**, e é +EV nos **dois lados e nos dois
+timeframes** (15m: comprar-YES **+7,3%** / comprar-NO **+8,3%**; 5m: **+32,6%** /
+**+16,4%**); vol baixa/média é profundamente −EV. A favorita-tardia **não tem edge
+direcional**, mas um **gate de regime de volatilidade a torna +EV** — valida diretamente a
+§1 (regime 2-camadas) e a memória `tv-loss-session-volatility`. **Próximo passo natural:
+um gate de volatilidade no fusion.**
 
 ## 3. Descobertas novas e acionáveis (o que NÃO tínhamos)
 
@@ -69,7 +89,7 @@ Testar com L2 histórico antes de assumir qualquer lado.
 completo da Polymarket**. Mata diretamente nossa dor central ("Polymarket não tem
 histórico L2; só coletamos daqui pra frente" — `validate-via-clob-orderbook`,
 `data-collection-philosophy`). Permite treinar/validar modelos de proxy com histórico
-real. **Avaliar custo/cobertura.**
+real. **Avaliada na §7 — veredito GO p/ trial free.**
 
 🥇 **Tick Rule falha (~50% de acerto) na Polymarket** [FATO, R1] por autocorrelação
 direcional positiva. Classificação heurística de agressor é enviesada → VPIN e spread
@@ -124,11 +144,41 @@ Os **negritos** aparecem nos dois relatórios ou casam diretamente com a tese fu
 
 ## 6. Próximos passos sugeridos
 
-1. Validar o **Yes Bias** (DOWN fraco é estrutural?) com L2 histórico — resolve a
-   contradição da §2.
-2. Avaliar **custo/cobertura da Resolved Markets API** (destrava treino supervisionado).
+1. ~~Validar o **Yes Bias**~~ ✅ **FEITO (§2)** — não há Yes-Bias direcional; o lever real
+   é o **regime de volatilidade**. → **Implementar um gate de volatilidade no fusion**
+   (tercil de alta-vol via range do mid/RV/ATR) e re-backtestar (`fusion-replay`/CPCV).
+2. ~~Avaliar **Resolved Markets API**~~ ✅ **FEITO (§7)** — veredito GO p/ trial free.
 3. Backtest **MLOFI vs sinais atuais** sob CPCV + Deflated Sharpe + custos reais.
 4. Priorizar setups **4h cross-asset** (#2, #3, #4) pela tese de generalização.
+
+## 7. Resolved Markets API — memo de avaliação (2026-06-23, docs públicos, sem gasto)
+
+Fonte: `resolvedmarkets.com/data/crypto` + busca. Operado por Elcara LLC-FZ (terceiro
+independente, não afiliado à Polymarket).
+
+1. **Cobertura:** **Polymarket-only** (sem Kalshi). Cripto BTC/ETH/SOL/XRP Up/Down em
+   **5m, 15m, 1h, 1d** (também sports/economics/weather/social). ⚠️ Anunciam **1h e 1d**,
+   **não 4h** — a nossa série 4h pode **não** estar coberta (confirmar no trial).
+2. **Profundidade histórica:** "unlimited history" no free tier; análogo PolymarketData
+   diz "August 2025 onward". Ou seja, **muito provavelmente há L2 anterior a 2026-06-11**
+   (o que NÃO temos) — esse é o valor central: backfill p/ ampliar o scan da §2 e habilitar
+   treino supervisionado. **Data de início absoluta não confirmada** (verificar no trial).
+3. **Granularidade:** **L2 completo** — arrays de bid/ask de profundidade, timestamp em ms,
+   **spot de referência pareado**, campo de staleness. ~**20 Hz** (~50ms quando o book se
+   move) — mais denso que nosso recorder (2s/15s). 700M+ snapshots em ClickHouse. **Sem
+   trades/OHLC** mencionados.
+4. **Acesso/custo:** REST API + WebSocket + **export parquet via CLI** + MCP server.
+   **Free tier:** dados cripto completos, histórico ilimitado, **5.000 créditos/mês**.
+   Pagos (Pro/Scale/Enterprise) liberam Strategy Builder / AI Backtest Agent. Custo por
+   crédito e rate limits **não publicados**.
+5. **Veredito: GO para um trial free (sem gasto).** Bate 2 dos 3 critérios com folga (L2
+   real + provável histórico pré-06-11) e o 3º (custo) é zero no free tier. **Riscos a
+   confirmar no trial:** (a) 4h coberto? (b) data de início real do histórico; (c) se
+   5.000 créditos/mês bastam p/ um pull em massa (ex.: 1 semana de BTC-15m L2). **Ação:**
+   criar conta free, puxar amostra BTC-15m de uma semana **pré-06-11**, conferir schema
+   vs nosso `orderbook_snapshots`/`orderbook_levels`. Só considerar plano pago depois.
+   Enquanto isso, nosso recorder próprio segue como fonte primária
+   (`data-collection-philosophy`).
 
 ## Memórias relacionadas
 
