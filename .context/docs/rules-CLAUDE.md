@@ -129,6 +129,10 @@ Dry run: Redis key `btc_trading:tv_dry_run` = "1" (set via `redis_control.py dry
 
 The receiver is deliberately a separate process — `15m_bot_runner.py` restarts `bot.py` periodically and the tunnel must keep a stable target. Don't fold it into `bot.py`.
 
+### Local signal generator (replaces TradingView)
+
+`local_signal_generator.py` is a drop-in **replacement for the TradingView webhook**: a separate process that streams Binance BTCUSDT 15m klines, computes the Guppy RSI signal locally (`local_signal/guppy.py` — pure, validated bar-for-bar against TradingView via `backtest guppy-parity`) and pushes the **same JSON to the same Redis queue** (`btc_trading:tradingview_signals`). The bot's `_handle_tradingview_signal` consumes it unchanged, so the whole trade path (N+1 select, book gate, conviction sizing, dry-run) and the `TV_*` knobs are reused. **Exclusivity:** run EITHER this OR `tradingview_webhook_receiver.py` — never both feeding the queue. Full mechanics: [.context/docs/local-signal-runbook.md](.context/docs/local-signal-runbook.md).
+
 ### Monitoring
 
 `grafana_exporter.py` exposes a Prometheus `/metrics` endpoint (default port 8000). The pre-built Grafana dashboard is in `grafana/dashboard.json`. Pass `--no-grafana` to skip starting the metrics server.
@@ -146,6 +150,8 @@ The receiver is deliberately a separate process — `15m_bot_runner.py` restarts
 | `patch_gamma_markets.py` | Monkey-patch applied at startup — do not remove |
 | `patch_market_orders.py` | Monkey-patch applied at startup — do not remove |
 | `tradingview_webhook_receiver.py` | Standalone HTTP receiver for TradingView alerts → Redis queue |
+| `local_signal_generator.py` | Local Guppy RSI generator (Binance klines) — replaces the TradingView webhook, same queue |
+| `local_signal/guppy.py` | Pure Guppy RSI signal (RSI Wilder → EMA 3/21 + volume); parity-validated vs TradingView |
 | `redis_control.py` | Runtime control CLI: sim/live mode and active strategy |
 | `.githooks/pre-commit` | Maestro Harness fail-closed commit gate — do not bypass |
 | `.agent/scripts/checklist.py` | Audit orchestrator run by the pre-commit hook |

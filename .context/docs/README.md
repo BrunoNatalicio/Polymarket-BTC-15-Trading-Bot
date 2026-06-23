@@ -13,6 +13,7 @@ Welcome to the repository knowledge base. Start with the project overview, then 
 - [Tooling & Productivity Guide](./tooling.md)
 - [Fusion Strategy (default)](./fusion-strategy.md)
 - [TradingView Strategy Runbook](./tradingview-runbook.md)
+- [Local Signal Runbook (Guppy RSI)](./local-signal-runbook.md)
 - [Backtest Validation & Reporting](./backtest-validation.md)
 - [TradingView Signal Confirmation Layer](./tv-confirmation-layer.md)
 - [TradingView Loss Post-mortem & Findings](./tv-loss-postmortem-findings.md)
@@ -38,5 +39,6 @@ Welcome to the repository knowledge base. Start with the project overview, then 
 | Tooling & Productivity Guide | `tooling.md` | CLI scripts, IDE configs, automation workflows |
 | Fusion Strategy (default) | `fusion-strategy.md` | Late-window favorite-follower mechanics, signal-activity gate, calibration-brain roadmap, `fusion-replay` backtest |
 | TradingView Strategy Runbook | `tradingview-runbook.md` | Webhook setup, dry-run validation, go-live checklist, troubleshooting |
+| Local Signal Runbook (Guppy RSI) | `local-signal-runbook.md` | Local Guppy generator replacing TradingView, parity gate, exclusivity, go-live E2E |
 | Backtest Validation & Reporting | `backtest-validation.md` | CLOB outcome resolution, settle/report commands, strategy-vs-bot hit-rate, pre-live fixes |
 | TradingView Loss Post-mortem & Findings | `tv-loss-postmortem-findings.md` | Loss slicing, session/volatility regime, CoinDesk cross-cut, session×p_side edge inversion, EU+band opt-in filter |

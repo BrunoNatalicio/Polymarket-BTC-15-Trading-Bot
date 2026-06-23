@@ -1,6 +1,6 @@
 # Project Rules and Guidelines
 
-> Auto-generated from .context/docs on 2026-06-23T17:22:41.630Z
+> Auto-generated from .context/docs on 2026-06-23T17:26:21.854Z
 
 ## rules-CLAUDE
 
@@ -135,6 +135,10 @@ Dry run: Redis key `btc_trading:tv_dry_run` = "1" (set via `redis_control.py dry
 
 The receiver is deliberately a separate process — `15m_bot_runner.py` restarts `bot.py` periodically and the tunnel must keep a stable target. Don't fold it into `bot.py`.
 
+### Local signal generator (replaces TradingView)
+
+`local_signal_generator.py` is a drop-in **replacement for the TradingView webhook**: a separate process that streams Binance BTCUSDT 15m klines, computes the Guppy RSI signal locally (`local_signal/guppy.py` — pure, validated bar-for-bar against TradingView via `backtest guppy-parity`) and pushes the **same JSON to the same Redis queue** (`btc_trading:tradingview_signals`). The bot's `_handle_tradingview_signal` consumes it unchanged, so the whole trade path (N+1 select, book gate, conviction sizing, dry-run) and the `TV_*` knobs are reused. **Exclusivity:** run EITHER this OR `tradingview_webhook_receiver.py` — never both feeding the queue. Full mechanics: [.context/docs/local-signal-runbook.md](.context/docs/local-signal-runbook.md).
+
 ### Monitoring
 
 `grafana_exporter.py` exposes a Prometheus `/metrics` endpoint (default port 8000). The pre-built Grafana dashboard is in `grafana/dashboard.json`. Pass `--no-grafana` to skip starting the metrics server.
@@ -152,6 +156,8 @@ The receiver is deliberately a separate process — `15m_bot_runner.py` restarts
 | `patch_gamma_markets.py` | Monkey-patch applied at startup — do not remove |
 | `patch_market_orders.py` | Monkey-patch applied at startup — do not remove |
 | `tradingview_webhook_receiver.py` | Standalone HTTP receiver for TradingView alerts → Redis queue |
+| `local_signal_generator.py` | Local Guppy RSI generator (Binance klines) — replaces the TradingView webhook, same queue |
+| `local_signal/guppy.py` | Pure Guppy RSI signal (RSI Wilder → EMA 3/21 + volume); parity-validated vs TradingView |
 | `redis_control.py` | Runtime control CLI: sim/live mode and active strategy |
 | `.githooks/pre-commit` | Maestro Harness fail-closed commit gate — do not bypass |
 | `.agent/scripts/checklist.py` | Audit orchestrator run by the pre-commit hook |
@@ -241,6 +247,7 @@ Welcome to the repository knowledge base. Start with the project overview, then 
 - [Tooling & Productivity Guide](./tooling.md)
 - [Fusion Strategy (default)](./fusion-strategy.md)
 - [TradingView Strategy Runbook](./tradingview-runbook.md)
+- [Local Signal Runbook (Guppy RSI)](./local-signal-runbook.md)
 - [Backtest Validation & Reporting](./backtest-validation.md)
 - [TradingView Signal Confirmation Layer](./tv-confirmation-layer.md)
 - [TradingView Loss Post-mortem & Findings](./tv-loss-postmortem-findings.md)
@@ -266,6 +273,7 @@ Welcome to the repository knowledge base. Start with the project overview, then 
 | Tooling & Productivity Guide | `tooling.md` | CLI scripts, IDE configs, automation workflows |
 | Fusion Strategy (default) | `fusion-strategy.md` | Late-window favorite-follower mechanics, signal-activity gate, calibration-brain roadmap, `fusion-replay` backtest |
 | TradingView Strategy Runbook | `tradingview-runbook.md` | Webhook setup, dry-run validation, go-live checklist, troubleshooting |
+| Local Signal Runbook (Guppy RSI) | `local-signal-runbook.md` | Local Guppy generator replacing TradingView, parity gate, exclusivity, go-live E2E |
 | Backtest Validation & Reporting | `backtest-validation.md` | CLOB outcome resolution, settle/report commands, strategy-vs-bot hit-rate, pre-live fixes |
 | TradingView Loss Post-mortem & Findings | `tv-loss-postmortem-findings.md` | Loss slicing, session/volatility regime, CoinDesk cross-cut, session×p_side edge inversion, EU+band opt-in filter |
 
