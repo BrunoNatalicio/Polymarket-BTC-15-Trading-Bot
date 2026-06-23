@@ -94,10 +94,15 @@ mid da janela INTEIRA) e misturava compra de longshots.
   min13 = favorita **menos** confiável.
 - **5m:** INSUFFICIENT (books finos, ~3184/3425 sem liquidez p/ $3 — fusion 5m mal
   preenche).
-- **Veredito: NÃO deployar gate de alta-vol; manter L0.** A infra (`--vol-gate`,
-  `--gate vol`, `vol`/`vol_std` nos trades) fica para testes futuros. *Pista in-sample não
-  validada:* nas janelas de **baixa** vol a favorita rendeu **melhor** (gate invertido) —
-  candidato a teste OOS próprio, com ceticismo (a hipótese de alta-vol inverteu no OOS).
+- **Gate INVERTIDO (baixa-vol) — também REPROVADO OOS (2026-06-23).** A pista in-sample
+  era real (`fusion-replay --vol-side low`: tercil de baixa-vol rende **+3,78% ROI/$** vs L0
+  **+1,99%/$** — concentra edge), MAS `fusion-cpcv --vol-side low` deu **NO GAIN**: delta
+  médio **−$5,57**, bate o L0 em só **40%** dos caminhos (L1 lucra +$11,21/path mas < L0
+  +$16,77/path). Ou seja, o gate só **negocia menos** — não bate o baseline.
+- **Veredito final da linha de volatilidade: NENHUMA direção do gate causal de vol bate o
+  L0 OOS — manter L0.** A infra (`--vol-gate`/`--vol-side`, `--gate vol`, `vol`/`vol_std`
+  nos trades) fica para uso futuro. O trend filter já captura o capturável; vol (alta ou
+  baixa) não adiciona edge fora de amostra.
 
 ## 3. Descobertas novas e acionáveis (o que NÃO tínhamos)
 
@@ -166,8 +171,8 @@ Os **negritos** aparecem nos dois relatórios ou casam diretamente com a tese fu
 2. ~~Avaliar **Resolved Markets API**~~ ✅ **FEITO (§7)** — veredito GO p/ trial free.
 3. Backtest **MLOFI vs sinais atuais** sob CPCV + Deflated Sharpe + custos reais.
 4. Priorizar setups **4h cross-asset** (#2, #3, #4) pela tese de generalização.
-5. *(opcional, cético)* testar um gate **invertido** (favorecer **baixa**-vol) OOS — pista
-   in-sample da §2, mas a hipótese de alta-vol já inverteu no OOS.
+5. ~~gate **invertido** (baixa-vol) OOS~~ ✅ **FEITO/REPROVADO (§2)** — NO GAIN também;
+   linha de volatilidade encerrada (nenhuma direção bate o L0 OOS).
 
 ## 7. Resolved Markets API — memo de avaliação (2026-06-23, docs públicos, sem gasto)
 

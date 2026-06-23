@@ -92,7 +92,8 @@ def _path_vol(
     mids = [
         m
         for m in (
-            _mid(b, a) for b, a in zip(sub["best_bid_m"], sub["best_ask_m"], strict=True)
+            _mid(b, a)
+            for b, a in zip(sub["best_bid_m"], sub["best_ask_m"], strict=True)
         )
         if m is not None
     ]
@@ -117,6 +118,7 @@ def run_fusion_replay(
     gate_fn: Callable[[str, float], bool] | None = None,
     stake_fn: Callable[[str, float, float], float] | None = None,
     vol_min: float | None = None,
+    vol_max: float | None = None,
 ) -> FusionReplayReport:
     """Replay the late-window favorite-follower over recorded markets.
 
@@ -166,7 +168,9 @@ def run_fusion_replay(
         # CAUSAL volatility of the YES mid up to entry (no lookahead). Gates the
         # market out when below vol_min; recorded on every executed trade.
         vol, vol_std = _path_vol(snaps, yes_tok, ws, target)
-        if vol_min is not None and vol < vol_min:
+        if (vol_min is not None and vol < vol_min) or (
+            vol_max is not None and vol > vol_max
+        ):
             report.gate_skip += 1
             continue
 

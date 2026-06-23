@@ -612,22 +612,29 @@ def cmd_fusion_replay(args: argparse.Namespace) -> int:
         rep = run_fusion_replay(con, fee_rate=args.fee_rate, **common)
         rep_gross = run_fusion_replay(con, fee_rate=0.0, **common)
         if args.vol_gate or args.vol_min is not None:
-            # vol threshold: explicit --vol-min, else the upper-tercile cutoff of
-            # L0's causal vols. Re-run the favorite-follower gated on vol >= cut.
+            # vol threshold from L0's causal vols. side=high keeps vol >= upper
+            # tercile; side=low keeps vol <= lower tercile (the inverted gate).
             from backtest.cpcv import _quantile
 
             vols = [float(t["vol"]) for t in rep.settled]
-            vol_cut = (
-                args.vol_min
-                if args.vol_min is not None
-                else _quantile(vols, args.vol_quantile)
-            )
+            if args.vol_side == "low":
+                vol_cut = (
+                    args.vol_min
+                    if args.vol_min is not None
+                    else _quantile(vols, 1.0 - args.vol_quantile)
+                )
+                vol_kwargs: dict[str, Any] = {"vol_max": vol_cut}
+            else:
+                vol_cut = (
+                    args.vol_min
+                    if args.vol_min is not None
+                    else _quantile(vols, args.vol_quantile)
+                )
+                vol_kwargs = {"vol_min": vol_cut}
             rep_vol = run_fusion_replay(
-                con, fee_rate=args.fee_rate, vol_min=vol_cut, **common
+                con, fee_rate=args.fee_rate, **vol_kwargs, **common
             )
-            rep_vol_gross = run_fusion_replay(
-                con, fee_rate=0.0, vol_min=vol_cut, **common
-            )
+            rep_vol_gross = run_fusion_replay(con, fee_rate=0.0, **vol_kwargs, **common)
         if args.gate == "ev":
             # L1: fit the Platt calibrator on L0's settled fills (IN-SAMPLE — smoke
             # test only, see calibration.py), then re-run gated on +EV vs the fee.
@@ -706,11 +713,14 @@ def cmd_fusion_replay(args: argparse.Namespace) -> int:
         from backtest.cpcv import _quantile
 
         print("-" * 70)
+        cmp_op = "<=" if args.vol_side == "low" else ">="
+        band = "baixa" if args.vol_side == "low" else "alta"
         print(
             f"  Gate de VOLATILIDADE (causal, YES-mid em [ws, entrada]): "
-            f"vol >= {vol_cut:.3f}  (quantil {args.vol_quantile:.2f} do L0)"
+            f"vol {cmp_op} {vol_cut:.3f}  (lado {args.vol_side}, "
+            f"quantil {args.vol_quantile:.2f} do L0)"
         )
-        stats_block("VOL — só janelas de alta-vol", rep_vol, rep_vol_gross)
+        stats_block(f"VOL — só janelas de {band}-vol", rep_vol, rep_vol_gross)
 
         # 2D: vol-tercil × p_side-bin — a alta-vol adiciona edge ALÉM do p_side?
         vols = [float(t["vol"]) for t in rep.settled]
@@ -818,10 +828,13 @@ def cmd_fusion_cpcv(args: argparse.Namespace) -> int:
             k_test=args.k_test,
             embargo_windows=args.embargo_windows,
             quantile=args.vol_quantile,
+            side=args.vol_side,
             window_seconds=window_seconds,
         )
         print(line)
-        print("FUSION CPCV — validacao out-of-sample do gate de VOLATILIDADE")
+        print(
+            f"FUSION CPCV — validacao OOS do gate de VOLATILIDADE (lado {args.vol_side})"
+        )
         print(line)
         if res["n_paths"] == 0:
             print(f"  Sem caminhos (fills={len(fills)}). Janela/dados insuficientes.")
@@ -1182,6 +1195,13 @@ def main(argv: list[str] | None = None) -> int:
         help="quantile of L0 vols used as the vol-gate cutoff (default 0.667 = "
         "upper tercile)",
     )
+    p_fusion.add_argument(
+        "--vol-side",
+        choices=["high", "low"],
+        default="high",
+        help="high = keep high-vol windows (vol >= cutoff); low = inverted gate, "
+        "keep low-vol windows (vol <= lower-tercile cutoff)",
+    )
 
     p_cpcv = sub.add_parser(
         "fusion-cpcv",
@@ -1227,6 +1247,12 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.667,
         help="train-fold vol quantile used as the gate cutoff (default 0.667)",
+    )
+    p_cpcv.add_argument(
+        "--vol-side",
+        choices=["high", "low"],
+        default="high",
+        help="high = gate keeps high-vol fills; low = inverted gate (low-vol)",
     )
 
     p_parity = sub.add_parser(

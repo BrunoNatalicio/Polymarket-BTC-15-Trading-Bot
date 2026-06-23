@@ -224,17 +224,25 @@ def score_path_vol(
     train_idx: Sequence[int],
     test_idx: Sequence[int],
     quantile: float,
+    side: str = "high",
 ) -> dict[str, Any]:
-    """Pick a vol threshold on TRAIN (its ``quantile`` cutoff), gate TEST on it.
+    """Pick a vol threshold on TRAIN, gate TEST on it (high or low band).
 
-    L1(vol) keeps only test fills with ``vol >= threshold`` (the threshold comes
-    from the train fold's vol distribution, so its choice never sees the test
-    fold). PnL/fee per fill are unchanged — the gate only drops some.
+    ``side="high"`` keeps test fills with ``vol >= q(train, quantile)`` (the
+    upper tail); ``side="low"`` keeps ``vol <= q(train, 1 - quantile)`` (the
+    lower tail). The threshold comes from the train fold only, so its choice
+    never sees the test fold. PnL/fee per fill are unchanged — the gate only
+    drops some.
     """
-    thr = _quantile([fills[i].vol for i in train_idx], quantile)
+    train_vols = [fills[i].vol for i in train_idx]
     test = [fills[i] for i in test_idx]
     l0_pnl = sum(f.pnl for f in test)
-    kept = [f for f in test if f.vol >= thr]
+    if side == "low":
+        thr = _quantile(train_vols, 1.0 - quantile)
+        kept = [f for f in test if f.vol <= thr]
+    else:
+        thr = _quantile(train_vols, quantile)
+        kept = [f for f in test if f.vol >= thr]
     l1_pnl = sum(f.pnl for f in kept)
     return {
         "threshold": thr,
@@ -254,15 +262,16 @@ def run_cpcv_vol(
     k_test: int = 2,
     embargo_windows: float = 1.0,
     quantile: float = 0.667,
+    side: str = "high",
     window_seconds: int = WINDOW_SECONDS,
     min_kept: int = 30,
 ) -> dict[str, Any]:
     """CPCV for the volatility gate: threshold fit on train, scored OOS on test.
 
-    Mirrors ``run_cpcv`` but for a vol-threshold gate instead of the Platt EV gate.
-    Verdict ``ADDS EDGE`` when the mean OOS delta is positive AND the gate beats L0
-    on at least half the paths; ``INSUFFICIENT`` when the thinnest path keeps fewer
-    than ``min_kept`` fills (too small a high-vol slice to trust).
+    Mirrors ``run_cpcv`` but for a vol-threshold gate (``side`` high or low band)
+    instead of the Platt EV gate. Verdict ``ADDS EDGE`` when the mean OOS delta is
+    positive AND the gate beats L0 on at least half the paths; ``INSUFFICIENT``
+    when the thinnest path keeps fewer than ``min_kept`` fills (slice too small).
     """
     embargo_s = embargo_windows * window_seconds
     paths: list[dict[str, Any]] = []
@@ -270,7 +279,7 @@ def run_cpcv_vol(
         train_idx = purge_embargo(fills, train_idx, test_idx, embargo_s)
         if not train_idx or not test_idx:
             continue
-        paths.append(score_path_vol(fills, train_idx, test_idx, quantile))
+        paths.append(score_path_vol(fills, train_idx, test_idx, quantile, side))
 
     if not paths:
         return {"n_paths": 0, "verdict": "NO PATHS", "paths": []}
@@ -293,6 +302,7 @@ def run_cpcv_vol(
         "n_fills": len(fills),
         "n_paths": n,
         "quantile": quantile,
+        "side": side,
         "mean_delta": mean_delta,
         "stdev_delta": statistics.pstdev(deltas) if n > 1 else 0.0,
         "pct_l1_beats_l0": l1_beats_l0 / n,
