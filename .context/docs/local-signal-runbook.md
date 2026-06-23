@@ -57,8 +57,17 @@ migrar do TradingView para o local:
 
 ## Subir o gerador
 
+Direto (uma vez):
+
 ```bash
 uv run python local_signal_generator.py
+```
+
+Supervisionado (auto-restart em crash, como o `15m_bot_runner.py` faz com o bot —
+use isto em produção, no lugar do receiver):
+
+```bash
+uv run python local_signal_runner.py
 ```
 
 Log esperado no boot: `Seeded N closed 15m candles for BTCUSDT; streaming…`.
