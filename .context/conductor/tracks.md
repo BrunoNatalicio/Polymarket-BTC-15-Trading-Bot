@@ -5,4 +5,4 @@
 
 | TRK ID | Status | Description | Link |
 |--------|--------|-------------|------|
-| TRK-001 | planning | Estratégia local Guppy RSI (substitui sinais do TradingView) | [Plan](../plans/TRK-001.md) |
+| TRK-001 | completed | Estratégia local Guppy RSI (substitui sinais do TradingView) | [Plan](../plans/TRK-001.md) |
