@@ -223,12 +223,19 @@ class BinanceWebSocketSource:
         finally:
             await self.disconnect()
 
-    async def stream_klines(self, interval: str = "1m") -> None:
+    async def stream_klines(
+        self,
+        interval: str = "1m",
+        on_closed: Callable[[dict], None] | None = None,
+    ) -> None:
         """
         Stream candlestick data.
 
         Args:
             interval: "1m", "5m", "15m", "1h", "4h", "1d", etc.
+            on_closed: optional callback invoked once per CLOSED candle (k["x"]),
+                receiving the candle dict. Back-compatible: when None, behaviour is
+                unchanged (debug log only).
         """
         await self.connect(f"kline_{interval}")
 
@@ -253,12 +260,58 @@ class BinanceWebSocketSource:
                     f"Binance kline ({interval}): O:{candle['open']} H:{candle['high']} L:{candle['low']} C:{candle['close']}"
                 )
 
+                if candle["is_closed"] and on_closed is not None:
+                    on_closed(candle)
+
         except websockets.exceptions.ConnectionClosed:
             logger.warning("Binance WebSocket connection closed")
         except Exception as e:
             logger.error(f"Error in Binance kline stream: {e}")
         finally:
             await self.disconnect()
+
+    def fetch_klines(
+        self,
+        symbol: str | None = None,
+        interval: str = "15m",
+        limit: int = 300,
+    ) -> list[dict]:
+        """Fetch the most recent klines via Binance REST — warmup seeding.
+
+        Synchronous (stdlib ``urllib``, no extra dependency): seeding runs once at
+        startup, before the async stream. Returns dicts in the SAME shape as the
+        stream callback (Decimal OHLCV, ``is_closed`` derived from closeTime), so
+        seed and live candles are uniform. Binance includes the still-forming
+        candle as the last row; it is marked ``is_closed=False``.
+        """
+        import time
+        import urllib.request
+
+        sym = (symbol or self.symbol).upper()
+        url = (
+            "https://api.binance.com/api/v3/klines"
+            f"?symbol={sym}&interval={interval}&limit={limit}"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})  # noqa: S310
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+            rows = json.loads(resp.read())
+
+        now_ms = time.time() * 1000.0
+        candles: list[dict] = []
+        for r in rows:
+            close_time_ms = float(r[6])
+            candles.append(
+                {
+                    "timestamp": datetime.fromtimestamp(r[0] / 1000),
+                    "open": Decimal(str(r[1])),
+                    "high": Decimal(str(r[2])),
+                    "low": Decimal(str(r[3])),
+                    "close": Decimal(str(r[4])),
+                    "volume": Decimal(str(r[5])),
+                    "is_closed": close_time_ms <= now_ms,
+                }
+            )
+        return candles
 
     @property
     def last_price(self) -> Decimal | None:
