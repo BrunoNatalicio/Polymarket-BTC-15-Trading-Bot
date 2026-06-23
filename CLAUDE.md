@@ -1,6 +1,6 @@
 # Project Rules and Guidelines
 
-> Auto-generated from .context/docs on 2026-06-23T18:58:57.742Z
+> Auto-generated from .context/docs on 2026-06-23T19:57:13.579Z
 
 ## rules-CLAUDE
 
@@ -251,6 +251,7 @@ Welcome to the repository knowledge base. Start with the project overview, then 
 - [Backtest Validation & Reporting](./backtest-validation.md)
 - [TradingView Signal Confirmation Layer](./tv-confirmation-layer.md)
 - [TradingView Loss Post-mortem & Findings](./tv-loss-postmortem-findings.md)
+- [Microstructure & Edge Research (deep-research synthesis)](./microstructure-edge-research.md)
 
 ## Repository Snapshot
 - Directories: `core/`, `data_sources/`, `execution/`, `feedback/`, `grafana/`, `monitoring/`, `workflow/`
@@ -276,6 +277,7 @@ Welcome to the repository knowledge base. Start with the project overview, then 
 | Local Signal Runbook (Guppy RSI) | `local-signal-runbook.md` | Local Guppy generator replacing TradingView, parity gate, exclusivity, go-live E2E |
 | Backtest Validation & Reporting | `backtest-validation.md` | CLOB outcome resolution, settle/report commands, strategy-vs-bot hit-rate, pre-live fixes |
 | TradingView Loss Post-mortem & Findings | `tv-loss-postmortem-findings.md` | Loss slicing, session/volatility regime, CoinDesk cross-cut, session×p_side edge inversion, EU+band opt-in filter |
+| Microstructure & Edge Research | `microstructure-edge-research.md` | Síntese de 2 deep-research; convergências (fee côncava, MLOFI, regime 2-camadas, CPCV+DSR); contradição FLB×Yes-Bias; Resolved Markets L2 API; Tick Rule enviesada; pool de 12 setups; implicações no código fusion |
 
 
 ## codex-instructions-AGENTS
