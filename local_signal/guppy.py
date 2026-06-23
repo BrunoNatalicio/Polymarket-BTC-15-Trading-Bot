@@ -150,38 +150,76 @@ def sma(values: Sequence[float], length: int) -> list[float]:
     return out
 
 
+def _decide(
+    prev_ma1: float,
+    ma1: float,
+    ma5: float,
+    volume: float,
+    vol_ma: float,
+    open_: float,
+    close: float,
+) -> Signal | None:
+    """Per-bar Guppy trigger (BR1, BR3) — the single source of truth shared by
+    `guppy_signal` and `guppy_signal_series`. Strict on volume/colour, non-strict
+    on momentum."""
+    change_ma1 = ma1 - prev_ma1
+    vol_ok = volume > vol_ma
+    if change_ma1 >= 0.0 and ma1 > ma5 and vol_ok and close > open_:
+        return "UP"
+    if change_ma1 <= 0.0 and ma1 < ma5 and vol_ok and close < open_:
+        return "DOWN"
+    return None
+
+
+def guppy_signal_series(
+    candles: Sequence[Candle], params: GuppyParams = DEFAULT_PARAMS
+) -> list[Signal | None]:
+    """Per-bar signal for every candle, computed in a single O(n) pass.
+
+    Entry `i` is what `guppy_signal(candles[:i+1])` would return — equal because
+    RSI/EMA/SMA are causal (a bar depends only on `[0..i]`). `None` while the
+    warmup is incomplete (BR5) or a bar is not closed (BR4). Assumes a gapless,
+    closed-terminated history (gaps are handled upstream by the generator, BR16).
+    """
+    n = len(candles)
+    out: list[Signal | None] = [None] * n
+    if n == 0:
+        return out
+
+    closes = [c["close"] for c in candles]
+    vols = [c["volume"] for c in candles]
+    rsi = wilder_rsi(closes, params.rsi_len)
+    ma1 = ema(rsi, params.fast)
+    ma5 = ema(rsi, params.slow)
+    vol_ma = sma(vols, params.vol_len)
+
+    closed_count = 0
+    for i in range(n):
+        if candles[i]["is_closed"]:
+            closed_count += 1
+        if i < 1 or closed_count < params.min_warmup or not candles[i]["is_closed"]:
+            continue
+        out[i] = _decide(
+            ma1[i - 1],
+            ma1[i],
+            ma5[i],
+            vols[i],
+            vol_ma[i],
+            candles[i]["open"],
+            candles[i]["close"],
+        )
+    return out
+
+
 def guppy_signal(
     candles: Sequence[Candle], params: GuppyParams = DEFAULT_PARAMS
 ) -> Signal | None:
     """Evaluate the latest CLOSED candle of `candles`. Returns 'UP'/'DOWN'/None.
 
     Pure: same input -> same output, no I/O (BR15). Returns None when the warmup
-    is incomplete (BR5) or the last candle is not closed (BR4). Comparisons match
-    the Pine script exactly: strict on volume/candle colour (a doji never fires),
-    non-strict on momentum (`>=` for UP, `<=` for DOWN) (BR3).
+    is incomplete (BR5) or the last candle is not closed (BR4). Thin wrapper over
+    `guppy_signal_series` so the trigger logic has one source of truth.
     """
-    closed = [c for c in candles if c["is_closed"]]
-    if len(closed) < params.min_warmup or len(closed) < 2:
+    if not candles:
         return None
-    if not candles[-1]["is_closed"]:
-        return None
-
-    closes = [c["close"] for c in closed]
-    vols = [c["volume"] for c in closed]
-
-    rsi = wilder_rsi(closes, params.rsi_len)
-    ma1 = ema(rsi, params.fast)
-    ma5 = ema(rsi, params.slow)
-    vol_ma = sma(vols, params.vol_len)
-
-    last = closed[-1]
-    change_ma1 = ma1[-1] - ma1[-2]
-    vol_ok = last["volume"] > vol_ma[-1]
-    bull = last["close"] > last["open"]
-    bear = last["close"] < last["open"]
-
-    if change_ma1 >= 0.0 and ma1[-1] > ma5[-1] and vol_ok and bull:
-        return "UP"
-    if change_ma1 <= 0.0 and ma1[-1] < ma5[-1] and vol_ok and bear:
-        return "DOWN"
-    return None
+    return guppy_signal_series(candles, params)[-1]

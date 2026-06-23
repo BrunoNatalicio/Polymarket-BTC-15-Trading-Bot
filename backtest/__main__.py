@@ -775,6 +775,42 @@ def cmd_fusion_cpcv(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_guppy_parity(args: argparse.Namespace) -> int:
+    from backtest.guppy_parity import run_parity
+    from local_signal.guppy import GuppyParams
+
+    params = GuppyParams(min_warmup=args.min_warmup)
+    rep = run_parity(args.csv, params, up_col=args.up_col, down_col=args.down_col)
+
+    print(f"\nGuppy parity vs TradingView export: {rep.csv_path}")
+    print(
+        f"  bars={rep.n_bars}  evaluated(post-warmup={params.min_warmup})={rep.n_eval}"
+    )
+    print(f"  TV fired: UP={rep.tv_up} DOWN={rep.tv_down} (total {rep.tv_fired})")
+    print(f"  local fired: UP={rep.local_up} DOWN={rep.local_down}")
+    print(
+        f"  agree: UP={rep.agree_up} DOWN={rep.agree_down} none={rep.agree_none}  "
+        f"| matched={rep.matched}"
+    )
+    print(
+        f"  disagree: tv_only(miss)={rep.tv_extra} local_only(extra)={rep.local_extra} "
+        f"conflict={rep.conflict}"
+    )
+    print(
+        f"  fired_match_rate={rep.fired_match_rate:.4f}  "
+        f"overall_agree_rate={rep.overall_agree_rate:.4f}"
+    )
+    print(
+        f"  max|err| vs TV cols: RSINorm={rep.rsi_max_abs_err:.4g} "
+        f"ma1={rep.ma1_max_abs_err:.4g} ma5={rep.ma5_max_abs_err:.4g}"
+    )
+    if rep.mismatches:
+        print("  first mismatches (bar, local, tv):")
+        for bar, local, tv in rep.mismatches[:25]:
+            print(f"    #{bar}: local={local} tv={tv}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="backtest")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -973,6 +1009,24 @@ def main(argv: list[str] | None = None) -> int:
         help="min train losses to trust a fit; below this the verdict is INSUFFICIENT",
     )
 
+    p_parity = sub.add_parser(
+        "guppy-parity",
+        help="validate local_signal.guppy against a TradingView CSV export (TRK-001 T3)",
+    )
+    p_parity.add_argument(
+        "--csv", required=True, help="TradingView chart-data CSV export"
+    )
+    p_parity.add_argument("--up-col", default=None, help="override UP signal column")
+    p_parity.add_argument(
+        "--down-col", default=None, help="override DOWN signal column"
+    )
+    p_parity.add_argument(
+        "--min-warmup",
+        type=int,
+        default=200,
+        help="bars to skip before comparing (RSI/EMA convergence; default 200)",
+    )
+
     args = parser.parse_args(argv)
     handlers = {
         "record": cmd_record,
@@ -984,6 +1038,7 @@ def main(argv: list[str] | None = None) -> int:
         "loss-postmortem": cmd_loss_postmortem,
         "fusion-replay": cmd_fusion_replay,
         "fusion-cpcv": cmd_fusion_cpcv,
+        "guppy-parity": cmd_guppy_parity,
     }
     return handlers[args.command](args)
 

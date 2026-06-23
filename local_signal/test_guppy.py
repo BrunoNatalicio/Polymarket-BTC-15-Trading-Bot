@@ -14,6 +14,7 @@ from local_signal.guppy import (  # noqa: E402
     GuppyParams,
     ema,
     guppy_signal,
+    guppy_signal_series,
     sma,
     wilder_rsi,
 )
@@ -131,6 +132,15 @@ def test_no_signal_last_candle_open():
 def test_determinism():
     candles = _series("up", last_volume=1000.0, last_open_delta=0.5)
     assert guppy_signal(candles, PARAMS) == guppy_signal(candles, PARAMS)
+
+
+def test_series_matches_single_call_on_prefixes():
+    # series[i] must equal guppy_signal(prefix[:i+1]) — causal equivalence (T3).
+    candles = _series("down", last_volume=1000.0, last_open_delta=-0.5)
+    series = guppy_signal_series(candles, PARAMS)
+    assert series[-1] == "DOWN"
+    for i in (205, 210, len(candles) - 1):
+        assert series[i] == guppy_signal(candles[: i + 1], PARAMS), i
 
 
 def main() -> int:
