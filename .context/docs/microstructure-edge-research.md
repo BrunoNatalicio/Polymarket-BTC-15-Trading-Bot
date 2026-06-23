@@ -75,13 +75,29 @@ estrutural sobre TODO mercado gravado (sem filtro de sinal), via
   fraco**; o "Yes Bias" de R1 **não replica** nos nossos 15m/5m. (4h: só 7 mercados BTC
   resolvidos — amostra vazia, reavaliar quando o recorder acumular.)
 
-→ **Achado-bônus, mais forte que a pergunta:** o corte por **volatilidade** é o que
-manda. O **tercil de alta-vol é o ÚNICO regime +EV**, e é +EV nos **dois lados e nos dois
-timeframes** (15m: comprar-YES **+7,3%** / comprar-NO **+8,3%**; 5m: **+32,6%** /
-**+16,4%**); vol baixa/média é profundamente −EV. A favorita-tardia **não tem edge
-direcional**, mas um **gate de regime de volatilidade a torna +EV** — valida diretamente a
-§1 (regime 2-camadas) e a memória `tv-loss-session-volatility`. **Próximo passo natural:
-um gate de volatilidade no fusion.**
+→ **Achado-bônus (in-sample, depois REFUTADO causalmente — ver abaixo):** no scan, o
+corte por **volatilidade** parecia mandar — o tercil de alta-vol era o único +EV nos dois
+lados/timeframes (15m +7–8%, 5m +16–32%). **Mas aquele proxy era NÃO-causal** (range do
+mid da janela INTEIRA) e misturava compra de longshots.
+
+→ **TESTE CAUSAL DO GATE DE VOLATILIDADE (2026-06-23) — REPROVADO.** Implementado um gate
+**causal** (range do YES-mid em `[ws, entrada]`) no fusion favorita-tardia
+(`fusion-replay --vol-gate`) e validado OOS (`fusion-cpcv --gate vol`):
+
+- **15m:** L0 (favorita, todo mercado) = **+$50,31** após fee; restringir ao **tercil de
+  alta-vol** despenca pra **+$1,15**. CPCV: **NO GAIN** — delta médio **−$15,01**, bate o
+  L0 em só **13%** dos 15 caminhos.
+- **Confound confirmado:** na tabela **vol-tercil × p_side**, controlando o p_side a
+  alta-vol **não adiciona edge** (ex. p_side≥.90: baixa +0,1% · média +1,7% · ALTA −1,0%).
+  O ganho que o scan atribuía à vol era, na verdade, **seleção de favorita-vs-coin-flip** —
+  que o **trend filter do fusion já captura**. Vol causal alta = preço instável até o
+  min13 = favorita **menos** confiável.
+- **5m:** INSUFFICIENT (books finos, ~3184/3425 sem liquidez p/ $3 — fusion 5m mal
+  preenche).
+- **Veredito: NÃO deployar gate de alta-vol; manter L0.** A infra (`--vol-gate`,
+  `--gate vol`, `vol`/`vol_std` nos trades) fica para testes futuros. *Pista in-sample não
+  validada:* nas janelas de **baixa** vol a favorita rendeu **melhor** (gate invertido) —
+  candidato a teste OOS próprio, com ceticismo (a hipótese de alta-vol inverteu no OOS).
 
 ## 3. Descobertas novas e acionáveis (o que NÃO tínhamos)
 
@@ -144,12 +160,14 @@ Os **negritos** aparecem nos dois relatórios ou casam diretamente com a tese fu
 
 ## 6. Próximos passos sugeridos
 
-1. ~~Validar o **Yes Bias**~~ ✅ **FEITO (§2)** — não há Yes-Bias direcional; o lever real
-   é o **regime de volatilidade**. → **Implementar um gate de volatilidade no fusion**
-   (tercil de alta-vol via range do mid/RV/ATR) e re-backtestar (`fusion-replay`/CPCV).
+1. ~~Validar o **Yes Bias**~~ ✅ **FEITO (§2)** — não há Yes-Bias direcional.
+1b. ~~Gate de volatilidade no fusion~~ ✅ **FEITO/REPROVADO (§2)** — o lever de vol **não
+   sobrevive causalmente** (CPCV NO GAIN); confound do proxy não-causal. Manter L0.
 2. ~~Avaliar **Resolved Markets API**~~ ✅ **FEITO (§7)** — veredito GO p/ trial free.
 3. Backtest **MLOFI vs sinais atuais** sob CPCV + Deflated Sharpe + custos reais.
 4. Priorizar setups **4h cross-asset** (#2, #3, #4) pela tese de generalização.
+5. *(opcional, cético)* testar um gate **invertido** (favorecer **baixa**-vol) OOS — pista
+   in-sample da §2, mas a hipótese de alta-vol já inverteu no OOS.
 
 ## 7. Resolved Markets API — memo de avaliação (2026-06-23, docs públicos, sem gasto)
 

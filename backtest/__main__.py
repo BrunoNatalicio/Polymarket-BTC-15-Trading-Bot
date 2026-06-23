@@ -594,6 +594,9 @@ def cmd_fusion_replay(args: argparse.Namespace) -> int:
     coeffs: tuple[float, float] | None = None
     rep_l1: FusionReplayReport | None = None
     rep_l1_gross: FusionReplayReport | None = None
+    rep_vol: FusionReplayReport | None = None
+    rep_vol_gross: FusionReplayReport | None = None
+    vol_cut: float | None = None
     try:
         settle_backfill(con)
         common: dict[str, Any] = dict(
@@ -608,6 +611,23 @@ def cmd_fusion_replay(args: argparse.Namespace) -> int:
         )
         rep = run_fusion_replay(con, fee_rate=args.fee_rate, **common)
         rep_gross = run_fusion_replay(con, fee_rate=0.0, **common)
+        if args.vol_gate or args.vol_min is not None:
+            # vol threshold: explicit --vol-min, else the upper-tercile cutoff of
+            # L0's causal vols. Re-run the favorite-follower gated on vol >= cut.
+            from backtest.cpcv import _quantile
+
+            vols = [float(t["vol"]) for t in rep.settled]
+            vol_cut = (
+                args.vol_min
+                if args.vol_min is not None
+                else _quantile(vols, args.vol_quantile)
+            )
+            rep_vol = run_fusion_replay(
+                con, fee_rate=args.fee_rate, vol_min=vol_cut, **common
+            )
+            rep_vol_gross = run_fusion_replay(
+                con, fee_rate=0.0, vol_min=vol_cut, **common
+            )
         if args.gate == "ev":
             # L1: fit the Platt calibrator on L0's settled fills (IN-SAMPLE — smoke
             # test only, see calibration.py), then re-run gated on +EV vs the fee.
@@ -682,6 +702,53 @@ def cmd_fusion_replay(args: argparse.Namespace) -> int:
     print("-" * 70)
     stats_block("L0 — sempre a favorita", rep, rep_gross)
 
+    if rep_vol is not None and rep_vol_gross is not None and vol_cut is not None:
+        from backtest.cpcv import _quantile
+
+        print("-" * 70)
+        print(
+            f"  Gate de VOLATILIDADE (causal, YES-mid em [ws, entrada]): "
+            f"vol >= {vol_cut:.3f}  (quantil {args.vol_quantile:.2f} do L0)"
+        )
+        stats_block("VOL — só janelas de alta-vol", rep_vol, rep_vol_gross)
+
+        # 2D: vol-tercil × p_side-bin — a alta-vol adiciona edge ALÉM do p_side?
+        vols = [float(t["vol"]) for t in rep.settled]
+        c1, c2 = _quantile(vols, 1 / 3), _quantile(vols, 2 / 3)
+
+        def vol_band(v: float) -> str:
+            return "baixa" if v < c1 else ("media" if v < c2 else "ALTA")
+
+        p_bins = [0.0, 0.60, 0.70, 0.80, 0.90, 1.01]
+        p_labels = ["<.60", ".60-.70", ".70-.80", ".80-.90", ">=.90"]
+
+        def p_band(p: float) -> str:
+            for i in range(len(p_bins) - 1):
+                if p_bins[i] <= p < p_bins[i + 1]:
+                    return p_labels[i]
+            return p_labels[-1]
+
+        cells: dict[tuple[str, str], list[float]] = {}
+        for t in rep.settled:
+            key = (vol_band(float(t["vol"])), p_band(float(t["p_side"])))
+            agg = cells.setdefault(key, [0.0, 0.0, 0.0])  # [n, sum_pnl, sum_filled]
+            agg[0] += 1
+            agg[1] += float(t["pnl"])
+            agg[2] += float(t["filled_usd"])
+
+        print("-" * 70)
+        print("  EV% por vol-tercil × p_side (controle do confound):")
+        print(f"  {'vol\\p_side':<11}" + "".join(f"{lbl:>12}" for lbl in p_labels))
+        for vb in ("baixa", "media", "ALTA"):
+            row = f"  {vb:<11}"
+            for pl in p_labels:
+                agg = cells.get((vb, pl))
+                if agg and agg[2] > 0:
+                    row += f"{agg[1] / agg[2]:>+10.1%}({int(agg[0])})".rjust(12)
+                else:
+                    row += f"{'-':>12}"
+            print(row)
+
     if coeffs is not None and rep_l1 is not None and rep_l1_gross is not None:
         from backtest.calibration import platt_prob
         from tv_market_select import fee_breakeven_prob
@@ -739,6 +806,73 @@ def cmd_fusion_cpcv(args: argparse.Namespace) -> int:
         con.close()
 
     fills = fills_from_trades(rep.settled)
+    line = "=" * 70
+
+    if args.gate == "vol":
+        from backtest.cpcv import run_cpcv_vol
+
+        window_seconds = 300 if args.series == "5m" else 900
+        res = run_cpcv_vol(
+            fills,
+            n_groups=args.n_groups,
+            k_test=args.k_test,
+            embargo_windows=args.embargo_windows,
+            quantile=args.vol_quantile,
+            window_seconds=window_seconds,
+        )
+        print(line)
+        print("FUSION CPCV — validacao out-of-sample do gate de VOLATILIDADE")
+        print(line)
+        if res["n_paths"] == 0:
+            print(f"  Sem caminhos (fills={len(fills)}). Janela/dados insuficientes.")
+            print(line)
+            return 0
+        print(
+            f"Fills L0 settled : {res['n_fills']} | C({args.n_groups},{args.k_test}) = "
+            f"{res['n_paths']} caminhos | quantil-vol {res['quantile']:.2f} | "
+            f"embargo {args.embargo_windows:.0f} janela(s)"
+        )
+        print("-" * 70)
+        print(
+            f"  {'path':>4} {'n_test':>6} {'gated':>6} {'thr':>7} "
+            f"{'L0 PnL':>9} {'L1 PnL':>9} {'delta':>9}"
+        )
+        for i, p in enumerate(res["paths"]):
+            print(
+                f"  {i:>4} {p['n_test']:>6} {p['gated_in']:>6} {p['threshold']:>7.3f} "
+                f"{p['l0_pnl']:>+9.2f} {p['l1_pnl']:>+9.2f} {p['delta']:>+9.2f}"
+            )
+        print("-" * 70)
+        print(
+            f"  delta medio (L1-L0): ${res['mean_delta']:+.2f} "
+            f"(desvio ${res['stdev_delta']:.2f})"
+        )
+        print(
+            f"  L1 > L0          : {res['pct_l1_beats_l0']:.0%} dos caminhos | "
+            f"L1 PnL>0: {res['pct_l1_positive']:.0%}"
+        )
+        print(
+            f"  PnL medio/path   : L0 ${res['mean_l0_pnl']:+.2f}  vs  "
+            f"L1 ${res['mean_l1_pnl']:+.2f}"
+        )
+        print(
+            f"  vol-thr medio    : {res['mean_threshold']:.3f} | fills mantidos/path: "
+            f"{res['mean_gated_in']:.0f} (min {res['min_gated_in']}, limite {res['min_kept']})"
+        )
+        print("-" * 70)
+        vol_verdict_msg = {
+            "INSUFFICIENT": "INSUFICIENTE — fatia de alta-vol fina demais em algum "
+            "caminho. Colete mais dados.",
+            "ADDS EDGE": "AGREGA — o gate de vol bate o L0 out-of-sample na maioria "
+            "dos caminhos.",
+            "NO GAIN": "SEM GANHO — o gate de vol nao supera o L0 baseline OOS.",
+        }
+        print(
+            f"  VEREDITO: {res['verdict']} — {vol_verdict_msg.get(res['verdict'], '')}"
+        )
+        print(line)
+        return 0
+
     res = run_cpcv(
         fills,
         n_groups=args.n_groups,
@@ -749,7 +883,6 @@ def cmd_fusion_cpcv(args: argparse.Namespace) -> int:
         min_minority=args.min_minority,
     )
 
-    line = "=" * 70
     print(line)
     print("FUSION CPCV — validacao out-of-sample do gate de EV (L1)")
     print(line)
@@ -1029,6 +1162,26 @@ def main(argv: list[str] | None = None) -> int:
         "(fit IN-SAMPLE for a smoke test, prints L0 vs L1)",
     )
     p_fusion.add_argument("--out-csv", help="optional path to dump per-trade rows")
+    p_fusion.add_argument(
+        "--vol-gate",
+        action="store_true",
+        help="also run L0 restricted to the high-vol tercile (causal YES-mid vol) "
+        "and print a vol×p_side EV table",
+    )
+    p_fusion.add_argument(
+        "--vol-min",
+        type=float,
+        default=None,
+        help="explicit causal-vol floor for the vol gate (overrides the tercile "
+        "cutoff); implies --vol-gate",
+    )
+    p_fusion.add_argument(
+        "--vol-quantile",
+        type=float,
+        default=0.667,
+        help="quantile of L0 vols used as the vol-gate cutoff (default 0.667 = "
+        "upper tercile)",
+    )
 
     p_cpcv = sub.add_parser(
         "fusion-cpcv",
@@ -1061,6 +1214,19 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=100,
         help="min train losses to trust a fit; below this the verdict is INSUFFICIENT",
+    )
+    p_cpcv.add_argument(
+        "--gate",
+        choices=["ev", "vol"],
+        default="ev",
+        help="ev = Platt +EV gate (default); vol = causal high-vol gate "
+        "(threshold fit on train, scored OOS on test)",
+    )
+    p_cpcv.add_argument(
+        "--vol-quantile",
+        type=float,
+        default=0.667,
+        help="train-fold vol quantile used as the gate cutoff (default 0.667)",
     )
 
     p_parity = sub.add_parser(

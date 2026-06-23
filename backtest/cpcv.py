@@ -40,6 +40,7 @@ class Fill:
     p_side: float  # bought favourite's implied prob (calibrator feature + price)
     won: float  # 1.0 win / 0.0 loss (the label)
     pnl: float  # realized PnL of this fill, net of fee (unchanged by the gate)
+    vol: float = 0.0  # causal pre-entry YES-mid volatility (the vol-gate feature)
 
 
 def fills_from_trades(trades: Sequence[dict[str, Any]]) -> list[Fill]:
@@ -50,12 +51,28 @@ def fills_from_trades(trades: Sequence[dict[str, Any]]) -> list[Fill]:
             p_side=float(t["p_side"]),
             won=1.0 if t["won"] else 0.0,
             pnl=float(t["pnl"]),
+            vol=float(t.get("vol", 0.0)),
         )
         for t in trades
         if t.get("pnl") is not None
     ]
     out.sort(key=lambda f: f.ts)
     return out
+
+
+def _quantile(xs: Sequence[float], q: float) -> float:
+    """Linear-interpolated quantile of ``xs`` (no numpy dependency)."""
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    if len(s) == 1:
+        return s[0]
+    idx = q * (len(s) - 1)
+    lo = int(idx)
+    frac = idx - lo
+    if lo + 1 < len(s):
+        return s[lo] * (1.0 - frac) + s[lo + 1] * frac
+    return s[lo]
 
 
 def _groups(n_items: int, n_groups: int) -> list[list[int]]:
@@ -197,6 +214,95 @@ def run_cpcv(
         "total_losses": int(sum(1.0 - f.won for f in fills)),
         "total_wins": int(sum(f.won for f in fills)),
         "min_minority": min_minority,
+        "verdict": verdict,
+        "paths": paths,
+    }
+
+
+def score_path_vol(
+    fills: Sequence[Fill],
+    train_idx: Sequence[int],
+    test_idx: Sequence[int],
+    quantile: float,
+) -> dict[str, Any]:
+    """Pick a vol threshold on TRAIN (its ``quantile`` cutoff), gate TEST on it.
+
+    L1(vol) keeps only test fills with ``vol >= threshold`` (the threshold comes
+    from the train fold's vol distribution, so its choice never sees the test
+    fold). PnL/fee per fill are unchanged — the gate only drops some.
+    """
+    thr = _quantile([fills[i].vol for i in train_idx], quantile)
+    test = [fills[i] for i in test_idx]
+    l0_pnl = sum(f.pnl for f in test)
+    kept = [f for f in test if f.vol >= thr]
+    l1_pnl = sum(f.pnl for f in kept)
+    return {
+        "threshold": thr,
+        "n_test": len(test),
+        "gated_in": len(kept),
+        "l0_pnl": l0_pnl,
+        "l1_pnl": l1_pnl,
+        "delta": l1_pnl - l0_pnl,
+        "l0_wins": int(sum(f.won for f in test)),
+        "l1_wins": int(sum(f.won for f in kept)),
+    }
+
+
+def run_cpcv_vol(
+    fills: Sequence[Fill],
+    n_groups: int = 6,
+    k_test: int = 2,
+    embargo_windows: float = 1.0,
+    quantile: float = 0.667,
+    window_seconds: int = WINDOW_SECONDS,
+    min_kept: int = 30,
+) -> dict[str, Any]:
+    """CPCV for the volatility gate: threshold fit on train, scored OOS on test.
+
+    Mirrors ``run_cpcv`` but for a vol-threshold gate instead of the Platt EV gate.
+    Verdict ``ADDS EDGE`` when the mean OOS delta is positive AND the gate beats L0
+    on at least half the paths; ``INSUFFICIENT`` when the thinnest path keeps fewer
+    than ``min_kept`` fills (too small a high-vol slice to trust).
+    """
+    embargo_s = embargo_windows * window_seconds
+    paths: list[dict[str, Any]] = []
+    for train_idx, test_idx in cpcv_splits(len(fills), n_groups, k_test):
+        train_idx = purge_embargo(fills, train_idx, test_idx, embargo_s)
+        if not train_idx or not test_idx:
+            continue
+        paths.append(score_path_vol(fills, train_idx, test_idx, quantile))
+
+    if not paths:
+        return {"n_paths": 0, "verdict": "NO PATHS", "paths": []}
+
+    deltas = [p["delta"] for p in paths]
+    n = len(paths)
+    l1_beats_l0 = sum(1 for p in paths if p["delta"] > 1e-9)
+    l1_positive = sum(1 for p in paths if p["l1_pnl"] > 1e-9)
+    mean_delta = statistics.fmean(deltas)
+    min_kept_path = min(p["gated_in"] for p in paths)
+
+    if min_kept_path < min_kept:
+        verdict = "INSUFFICIENT"  # high-vol slice too thin on some path to trust
+    elif mean_delta > 1e-9 and l1_beats_l0 * 2 >= n:
+        verdict = "ADDS EDGE"
+    else:
+        verdict = "NO GAIN"
+
+    return {
+        "n_fills": len(fills),
+        "n_paths": n,
+        "quantile": quantile,
+        "mean_delta": mean_delta,
+        "stdev_delta": statistics.pstdev(deltas) if n > 1 else 0.0,
+        "pct_l1_beats_l0": l1_beats_l0 / n,
+        "pct_l1_positive": l1_positive / n,
+        "mean_l0_pnl": statistics.fmean([p["l0_pnl"] for p in paths]),
+        "mean_l1_pnl": statistics.fmean([p["l1_pnl"] for p in paths]),
+        "mean_threshold": statistics.fmean([p["threshold"] for p in paths]),
+        "mean_gated_in": statistics.fmean([float(p["gated_in"]) for p in paths]),
+        "min_gated_in": min_kept_path,
+        "min_kept": min_kept,
         "verdict": verdict,
         "paths": paths,
     }

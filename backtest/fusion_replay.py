@@ -17,9 +17,10 @@ refactoring. Reuses ``ingest`` (load), ``matching`` (depth-walk + taker fee) and
 from __future__ import annotations
 
 import sqlite3
+import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 
@@ -66,7 +67,40 @@ def _nearest(snaps: pd.DataFrame, token_id: str, target_ts: float) -> pd.Series 
     sub = snaps[snaps["token_id"].astype(str) == str(token_id)]
     if sub.empty:
         return None
-    return sub.loc[(sub["ts"] - target_ts).abs().idxmin()]
+    dist = cast("pd.Series", sub["ts"] - target_ts).abs()
+    return sub.loc[dist.idxmin()]
+
+
+def _path_vol(
+    snaps: pd.DataFrame, token_id: str, lo_ts: float, hi_ts: float
+) -> tuple[float, float]:
+    """CAUSAL volatility of the YES mid over ``[lo_ts, hi_ts]`` (entry-time info only).
+
+    Returns ``(range, std_of_diffs)``: the peak-to-trough range of the mid (same
+    proxy as ``bias_scan``, truncated to pre-entry so it's causal) and the
+    standard deviation of consecutive mid changes (path choppiness, less
+    confounded with the favourite's final extremity). ``(0.0, 0.0)`` when fewer
+    than two priced snapshots exist in the window.
+    """
+    sub = snaps[
+        (snaps["token_id"].astype(str) == str(token_id))
+        & (snaps["ts"] >= lo_ts)
+        & (snaps["ts"] <= hi_ts)
+    ]
+    if sub.empty:
+        return 0.0, 0.0
+    mids = [
+        m
+        for m in (
+            _mid(b, a) for b, a in zip(sub["best_bid_m"], sub["best_ask_m"], strict=True)
+        )
+        if m is not None
+    ]
+    if len(mids) < 2:
+        return 0.0, 0.0
+    rng = max(mids) - min(mids)
+    diffs = [mids[i] - mids[i - 1] for i in range(1, len(mids))]
+    return rng, statistics.pstdev(diffs)
 
 
 def run_fusion_replay(
@@ -82,6 +116,7 @@ def run_fusion_replay(
     trend_down: float = 0.40,
     gate_fn: Callable[[str, float], bool] | None = None,
     stake_fn: Callable[[str, float, float], float] | None = None,
+    vol_min: float | None = None,
 ) -> FusionReplayReport:
     """Replay the late-window favorite-follower over recorded markets.
 
@@ -102,7 +137,10 @@ def run_fusion_replay(
     if markets.empty:
         return report
     sel = markets[markets["market_slug"].str.startswith(slug_prefix)]
-    sel = sel[(sel["window_start"] >= start_ts) & (sel["window_start"] < end_ts)]
+    sel = cast(
+        "pd.DataFrame",
+        sel[(sel["window_start"] >= start_ts) & (sel["window_start"] < end_ts)],
+    )
 
     for row in sel.to_dict("records"):
         report.markets_total += 1
@@ -111,8 +149,10 @@ def run_fusion_replay(
         outcome = row["outcome"] if isinstance(row["outcome"], str) else None
         target = ws + entry_second
 
+        # Load from window_start so the YES path in [ws, target] is available for
+        # the causal volatility, not just the near-entry decision snapshots.
         snaps = ingest.load_snapshot_meta(
-            con, [yes_tok, no_tok], target - entry_tolerance, target + entry_tolerance
+            con, [yes_tok, no_tok], ws, target + entry_tolerance
         )
         yes_snap = _nearest(snaps, yes_tok, target)
         if yes_snap is None:
@@ -121,6 +161,13 @@ def run_fusion_replay(
         yes_mid = _mid(yes_snap["best_bid_m"], yes_snap["best_ask_m"])
         if yes_mid is None:
             report.unfilled_no_data += 1
+            continue
+
+        # CAUSAL volatility of the YES mid up to entry (no lookahead). Gates the
+        # market out when below vol_min; recorded on every executed trade.
+        vol, vol_std = _path_vol(snaps, yes_tok, ws, target)
+        if vol_min is not None and vol < vol_min:
+            report.gate_skip += 1
             continue
 
         # TREND FILTER (follow the favorite) — identical to bot.py's live rule.
@@ -165,6 +212,8 @@ def run_fusion_replay(
             "token_id": bought_tok,
             "entry_mid": yes_mid,
             "p_side": p_side,
+            "vol": vol,
+            "vol_std": vol_std,
             "snapshot_age_s": float(bought_snap["ts"]) - target,
             "best_quote": fill.best_quote,
             "vwap": fill.vwap,
