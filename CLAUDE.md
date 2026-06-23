@@ -1,6 +1,6 @@
 # Project Rules and Guidelines
 
-> Auto-generated from .context/docs on 2026-06-23T17:09:00.605Z
+> Auto-generated from .context/docs on 2026-06-23T17:11:30.518Z
 
 ## rules-CLAUDE
 
@@ -161,6 +161,8 @@ The receiver is deliberately a separate process — `15m_bot_runner.py` restarts
 Copy `.env.example` to `.env` before running. Required keys: `POLYMARKET_PK`, `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, `POLYMARKET_PASSPHRASE`. Redis defaults to `localhost:6379` DB 2.
 
 Python version is pinned in `.python-version` (3.13). Use `uv` — there is no `scripts/` test runner entry point; tests are standalone scripts, not pytest suites.
+
+This is a Windows environment: always use Windows-style paths (`C:\...`) not MSYS/POSIX paths (`/c/...`), and account for console encoding (avoid unicode that breaks cp1252).
 
 
 ## rules-AGENTS
