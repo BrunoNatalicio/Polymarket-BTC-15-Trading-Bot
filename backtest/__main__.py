@@ -48,6 +48,19 @@ def _add_entry_filter_args(p: argparse.ArgumentParser) -> None:
         default=1.0,
         help="conviction sizing: min stake fraction at the gate (1.0 = flat)",
     )
+    p.add_argument(
+        "--max-entry-prob",
+        type=float,
+        default=1.0,
+        help="band ceiling: skip a signal whose bought-side book prob >= this "
+        "(1.0 = off). With --min-entry-prob forms the entry-prob band, e.g. 0.42-0.50",
+    )
+    p.add_argument(
+        "--trade-hours",
+        default="",
+        help="session filter: UTC hour whitelist, e.g. '8-15' (EU) or '0,4,8-10'; "
+        "empty = all hours (off)",
+    )
 
 
 def cmd_record(_args: argparse.Namespace) -> int:
@@ -70,6 +83,7 @@ def cmd_settle(_args: argparse.Namespace) -> int:
 
 def cmd_replay(args: argparse.Namespace) -> int:
     from backtest.engine import run_replay, trades_dataframe
+    from tv_market_select import parse_trade_hours
 
     start = _parse_when(args.start) if args.start else 0.0
     end = _parse_when(args.end) if args.end else time.time()
@@ -88,6 +102,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
             min_entry_prob=args.min_entry_prob,
             size_full_prob=args.size_full_prob,
             size_min_frac=args.size_min_frac,
+            max_entry_prob=args.max_entry_prob,
+            trade_hours=parse_trade_hours(args.trade_hours),
         )
     finally:
         con.close()
@@ -416,6 +432,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     )
     from backtest.engine import run_replay
     from backtest.settlement import settle_backfill
+    from tv_market_select import parse_trade_hours
 
     start = _parse_when(args.start) if args.start else 0.0
     end = _parse_when(args.end) if args.end else time.time()
@@ -434,6 +451,8 @@ def cmd_report(args: argparse.Namespace) -> int:
             min_entry_prob=args.min_entry_prob,
             size_full_prob=args.size_full_prob,
             size_min_frac=args.size_min_frac,
+            max_entry_prob=args.max_entry_prob,
+            trade_hours=parse_trade_hours(args.trade_hours),
         )
         trades = load_bot_trades(args.bot_trades)
         bot = evaluate_bot_trades(con, trades, fee_rate=args.fee_rate)

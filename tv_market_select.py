@@ -107,6 +107,66 @@ def conviction_stake(
     return base_usd * min(1.0, max(min_frac, frac))
 
 
+def parse_trade_hours(spec: str) -> set[int]:
+    """Parse a UTC hour-of-day whitelist into a set of hours in [0, 23].
+
+    Accepts comma-separated hours and/or inclusive ranges; an empty string means
+    NO filter (trade every hour)::
+
+        ""        -> set()                (no filter)
+        "8-15"    -> {8, 9, ..., 15}      (EU session 08-16 UTC)
+        "0,4,8"   -> {0, 4, 8}
+        "8-11,14" -> {8, 9, 10, 11, 14}
+
+    Hours outside [0, 23] are dropped; malformed parts raise ``ValueError`` (a
+    bad operator-set knob should fail loud, not silently trade 24/7).
+    """
+    hours: set[int] = set()
+    for raw in spec.split(","):
+        part = raw.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo_s, hi_s = part.split("-", 1)
+            lo, hi = int(lo_s), int(hi_s)
+            hours.update(h for h in range(lo, hi + 1) if 0 <= h <= 23)
+        else:
+            h = int(part)
+            if 0 <= h <= 23:
+                hours.add(h)
+    return hours
+
+
+def window_hour_utc(window_start_ts: float) -> int:
+    """UTC hour-of-day (0-23) of a window-start unix timestamp."""
+    return (int(window_start_ts) // 3600) % 24
+
+
+def passes_session_band(
+    window_start_ts: float,
+    p_side: float,
+    allowed_hours: set[int],
+    p_ceiling: float = 1.0,
+) -> bool:
+    """Opt-in session + entry-prob-ceiling filter — default is a NO-OP.
+
+    Layered ON TOP of the book-agreement floor in ``conviction_stake`` (which
+    still owns the lower bound). This adds two optional cuts, both off by default:
+
+    * ``allowed_hours`` non-empty and the window's UTC hour not in it -> skip
+      (trade only the chosen sessions, e.g. ``parse_trade_hours("8-15")`` = EU).
+    * ``p_side >= p_ceiling`` -> skip (upper bound of the entry-prob band).
+
+    Empty ``allowed_hours`` AND ``p_ceiling == 1.0`` reproduce current behaviour
+    exactly (always ``True``), so the filter is inert until configured. Motivated
+    by the loss post-mortem: the strategy's edge sits in the EU session and the
+    ``p_side`` 0.42-0.50 band; outside it the 15m up/down is a coin-flip.
+    """
+    if allowed_hours and window_hour_utc(window_start_ts) not in allowed_hours:
+        return False
+    return p_side < p_ceiling
+
+
 def _logit(p: float) -> float:
     """Log-odds of ``p``, clamped just inside (0, 1) so it stays finite."""
     p = min(1.0 - 1e-9, max(1e-9, p))

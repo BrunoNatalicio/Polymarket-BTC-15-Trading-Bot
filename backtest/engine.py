@@ -14,7 +14,7 @@ import pandas as pd
 import backtest.ingest as ingest
 import backtest.matching as matching
 import backtest.settlement as settlement
-from tv_market_select import confirm_signal, conviction_stake
+from tv_market_select import confirm_signal, conviction_stake, passes_session_band
 
 SERIES = {
     "15m": ("btc-updown-15m-", 900),
@@ -32,6 +32,7 @@ class ReplayReport:
     unfilled_no_market: int = 0
     unfilled_no_liquidity: int = 0
     unfilled_min_book_prob: int = 0
+    unfilled_filtered: int = 0
     unsettled: int = 0
 
     @property
@@ -48,7 +49,8 @@ class ReplayReport:
             + self.unfilled_no_data
             + self.unfilled_no_market
             + self.unfilled_no_liquidity
-            + self.unfilled_min_book_prob,
+            + self.unfilled_min_book_prob
+            + self.unfilled_filtered,
             "fills": len(self.trades),
             "settled": len(settled),
             "unsettled": self.unsettled,
@@ -56,6 +58,7 @@ class ReplayReport:
             "unfilled_no_market": self.unfilled_no_market,
             "unfilled_no_liquidity": self.unfilled_no_liquidity,
             "unfilled_min_book_prob": self.unfilled_min_book_prob,
+            "unfilled_filtered": self.unfilled_filtered,
             "wins": wins,
             "win_rate": (wins / len(settled)) if settled else None,
             "total_pnl": pnl,
@@ -108,6 +111,8 @@ def run_replay(
     min_entry_prob: float = 0.0,
     size_full_prob: float = 1.0,
     size_min_frac: float = 1.0,
+    max_entry_prob: float = 1.0,
+    trade_hours: set[int] | None = None,
     confirm_side: str | None = None,
     confirm_base_rate: float = 0.5,
     confirm_beta: float = 0.0,
@@ -177,6 +182,14 @@ def run_replay(
             # uses. Hybrid gate + sizing decides the stake before the fill.
             p_side = _bought_side_prob(row, asks)
             direction = str(row["direction"])
+            # Opt-in session + entry-prob-band filter (default no-op): skip windows
+            # outside the allowed UTC sessions or with p_side at/above the ceiling.
+            # Shared with the live bot via passes_session_band.
+            if not passes_session_band(
+                int(row["window_start"]), p_side, trade_hours or set(), max_entry_prob
+            ):
+                report.unfilled_filtered += 1
+                continue
             # Calibrated confirmation gate replaces the book-agreement floor for
             # ``confirm_side`` only (default None -> conviction_stake baseline
             # unchanged). Sizing is held flat on a confirmed trade — sizing is a

@@ -15,6 +15,7 @@ Welcome to the repository knowledge base. Start with the project overview, then 
 - [TradingView Strategy Runbook](./tradingview-runbook.md)
 - [Backtest Validation & Reporting](./backtest-validation.md)
 - [TradingView Signal Confirmation Layer](./tv-confirmation-layer.md)
+- [TradingView Loss Post-mortem & Findings](./tv-loss-postmortem-findings.md)
 
 ## Repository Snapshot
 - Directories: `core/`, `data_sources/`, `execution/`, `feedback/`, `grafana/`, `monitoring/`, `workflow/`
@@ -38,3 +39,4 @@ Welcome to the repository knowledge base. Start with the project overview, then 
 | Fusion Strategy (default) | `fusion-strategy.md` | Late-window favorite-follower mechanics, signal-activity gate, calibration-brain roadmap, `fusion-replay` backtest |
 | TradingView Strategy Runbook | `tradingview-runbook.md` | Webhook setup, dry-run validation, go-live checklist, troubleshooting |
 | Backtest Validation & Reporting | `backtest-validation.md` | CLOB outcome resolution, settle/report commands, strategy-vs-bot hit-rate, pre-live fixes |
+| TradingView Loss Post-mortem & Findings | `tv-loss-postmortem-findings.md` | Loss slicing, session/volatility regime, CoinDesk cross-cut, session×p_side edge inversion, EU+band opt-in filter |

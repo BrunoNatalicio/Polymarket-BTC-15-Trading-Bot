@@ -88,7 +88,10 @@ from tv_market_select import (
     conviction_stake,
     entry_prob_and_price,
     fresh_quote,
+    parse_trade_hours,
+    passes_session_band,
     select_target_market,
+    window_hour_utc,
 )
 
 load_dotenv()
@@ -333,6 +336,12 @@ class IntegratedBTCStrategy(Strategy):
         self._tv_min_book_prob = float(os.getenv("TV_MIN_BOOK_PROB", "0.42"))
         self._tv_size_full_prob = float(os.getenv("TV_SIZE_FULL_PROB", "0.55"))
         self._tv_size_min_frac = float(os.getenv("TV_SIZE_MIN_FRAC", "1.0"))
+        # Opt-in session + entry-prob-band filter (post-mortem: edge sits in the
+        # EU session 08-16 UTC and the p_side 0.42-0.50 band). Defaults below are
+        # a NO-OP (no hour filter, ceiling 1.0) — current behaviour unchanged until
+        # validated OOS and set in .env. See tv_market_select.passes_session_band.
+        self._tv_trade_hours = parse_trade_hours(os.getenv("TV_TRADE_HOURS", ""))
+        self._tv_max_book_prob = float(os.getenv("TV_MAX_BOOK_PROB", "1.0"))
 
         if test_mode:
             logger.info("=" * 80)
@@ -1188,6 +1197,23 @@ class IntegratedBTCStrategy(Strategy):
         # stop entering when the book already prices our side as a deep underdog
         # (every historical loss sat below the floor). stake==0 => gate skip.
         p_side, entry_price = entry_prob_and_price(signal, float(bid_d), float(ask_d))
+        # Opt-in session + entry-prob-band filter (default no-op; see __init__).
+        # Layered above the floor gate: skips windows outside the allowed UTC
+        # sessions or with p_side at/above the band ceiling.
+        if not passes_session_band(
+            target_market["market_timestamp"],
+            p_side,
+            self._tv_trade_hours,
+            self._tv_max_book_prob,
+        ):
+            logger.warning(
+                f"TV signal {signal} DISCARDED — session/band filter "
+                f"(hour {window_hour_utc(target_market['market_timestamp'])} UTC, "
+                f"p_side={p_side:.3f}; allowed_hours="
+                f"{sorted(self._tv_trade_hours) or 'all'}, "
+                f"ceiling={self._tv_max_book_prob:.2f})"
+            )
+            return
         stake = conviction_stake(
             p_side,
             float(POSITION_SIZE_USD),

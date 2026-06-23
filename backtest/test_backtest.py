@@ -671,6 +671,50 @@ def test_candidate_window_starts():
     check("phase-shifted start is among candidates", shifted_start in cands2)
 
 
+def test_session_band_filter():
+    print("\n14. session + entry-prob-band filter in run_replay")
+    import backtest.db as db
+    from backtest.engine import run_replay
+    from tv_market_select import parse_trade_hours
+
+    con = db.connect(":memory:")
+    w_eu = 864043200  # hour 12 UTC (EU session), 900s-aligned
+    w_asia = 864007200  # hour 2 UTC (Asia session), 900s-aligned
+    for w, tok in ((w_eu, "YE"), (w_asia, "YA")):
+        db.upsert_market(con, f"btc-updown-15m-{w}", tok, "N" + tok, w, w + 900)
+        db.set_market_outcome(con, f"btc-updown-15m-{w}", "YES", "gamma")
+        db.insert_signal(con, f"sig-{w}", w + 100.0, "UP")
+        db.insert_snapshot(
+            con,
+            ts=w + 101.0,
+            market_slug=f"btc-updown-15m-{w}",
+            token_id=tok,
+            side_label="YES",
+            bids=[(0.45, 500.0)],  # p_side mid = 0.455
+            asks=[(0.46, 500.0)],
+        )
+    start, end = w_asia, w_eu + 3000
+
+    base = run_replay(con, start_ts=start, end_ts=end, stake_usd=3.0).summary()
+    check("no filter -> both fill", base["fills"] == 2)
+    check("no filter -> 0 filtered", base["unfilled_filtered"] == 0)
+
+    eu = run_replay(
+        con, start_ts=start, end_ts=end, stake_usd=3.0,
+        trade_hours=parse_trade_hours("8-15"),
+    ).summary()
+    check("EU hours -> 1 fill (Asia dropped)", eu["fills"] == 1)
+    check("EU hours -> 1 filtered", eu["unfilled_filtered"] == 1)
+    check("filtered counts in signals_total", eu["signals_total"] == 2)
+
+    cap = run_replay(
+        con, start_ts=start, end_ts=end, stake_usd=3.0, max_entry_prob=0.45,
+    ).summary()
+    check("ceiling 0.45 (< mid 0.455) -> 0 fills", cap["fills"] == 0)
+    check("ceiling 0.45 -> both filtered", cap["unfilled_filtered"] == 2)
+    con.close()
+
+
 def main() -> int:
     print("=" * 60)
     print("BACKTEST REPLAY ENGINE - TESTS")
@@ -689,6 +733,7 @@ def main() -> int:
     test_calibration()
     test_cpcv()
     test_candidate_window_starts()
+    test_session_band_filter()
 
     print("\n" + "=" * 60)
     print(f"RESULT: {PASSED} passed, {FAILED} failed")

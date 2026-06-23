@@ -283,6 +283,38 @@ def test_entry_gate_and_sizing():
     )
 
 
+def test_session_band():
+    print("\n9b. session + entry-prob-band filter (opt-in, default no-op)")
+    from tv_market_select import (
+        parse_trade_hours,
+        passes_session_band,
+        window_hour_utc,
+    )
+
+    check("parse empty -> no filter", parse_trade_hours("") == set())
+    check("parse range", parse_trade_hours("8-15") == {8, 9, 10, 11, 12, 13, 14, 15})
+    check("parse list+range", parse_trade_hours("0,4,8-10") == {0, 4, 8, 9, 10})
+    check("parse drops out-of-range", parse_trade_hours("23-25") == {23})
+
+    eu_ws = 1781524800  # 2026-06-15 12:00 UTC (EU block)
+    asia_ws = 1781481600  # 2026-06-15 00:00 UTC (Asia block)
+    check("window_hour_utc EU", window_hour_utc(eu_ws) == 12)
+    check("window_hour_utc Asia", window_hour_utc(asia_ws) == 0)
+
+    eu = parse_trade_hours("8-15")
+    # Defaults = NO-OP: empty hours + ceiling 1.0 -> always True.
+    check(
+        "no-op passes any window/prob",
+        passes_session_band(asia_ws, 0.99, set(), 1.0),
+    )
+    # Session cut: EU window passes, Asia blocked.
+    check("EU window in-session", passes_session_band(eu_ws, 0.46, eu, 0.50))
+    check("Asia window out-of-session", not passes_session_band(asia_ws, 0.46, eu, 0.50))
+    # Band ceiling: below passes, at/above blocked.
+    check("below ceiling passes", passes_session_band(eu_ws, 0.46, eu, 0.50))
+    check("at/above ceiling blocked", not passes_session_band(eu_ws, 0.55, eu, 0.50))
+
+
 def test_calibrated_confirmation():
     print("\n10. calibrated confirmation layer (posterior + fee breakeven)")
     from tv_market_select import (
@@ -578,6 +610,7 @@ def main() -> int:
     test_extra_fields()
     test_rollover_market_selection()
     test_entry_gate_and_sizing()
+    test_session_band()
     test_calibrated_confirmation()
     test_z_momentum()
     test_redis_resilience()
