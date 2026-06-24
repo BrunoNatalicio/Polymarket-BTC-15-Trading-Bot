@@ -144,6 +144,9 @@ $RECYCLE.BIN/
 node_modules/
 .cache/
 
+# Research papers / large reference docs (not project code or docs)
+*.pdf
+
 # =============================================================================
 # TOOLING
 # =============================================================================
