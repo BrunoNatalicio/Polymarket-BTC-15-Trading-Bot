@@ -3,6 +3,7 @@
 Welcome to the repository knowledge base. Start with the project overview, then dive into specific guides as needed.
 
 ## Core Guides
+- [Setups Status (snapshot dos dois setups)](./setups-status.md)
 - [Project Overview](./project-overview.md)
 - [Architecture Notes](./architecture.md)
 - [Development Workflow](./development-workflow.md)
@@ -30,6 +31,7 @@ Welcome to the repository knowledge base. Start with the project overview, then 
 ## Document Map
 | Guide | File | Primary Inputs |
 | --- | --- | --- |
+| Setups Status | `setups-status.md` | Snapshot de registro completo dos dois setups (Fusion + TradingView/Guppy); estado, achados validados/reprovados (CPCV), tabelas de backtest/stake/bankroll, config de produção, próximos passos |
 | Project Overview | `project-overview.md` | Roadmap, README, stakeholder notes |
 | Architecture Notes | `architecture.md` | ADRs, service boundaries, dependency graphs |
 | Development Workflow | `development-workflow.md` | Branching rules, CI config, contributing guide |
